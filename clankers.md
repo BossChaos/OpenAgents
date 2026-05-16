@@ -11,3 +11,4 @@ Automated tracking of all Clankers PR contributors.
 | shengtenghou4-star | 1 | 2026-05-16T13:27:12.096Z | 2026-05-16T13:27:12.096Z |
 | CuboYe | 1 | 2026-05-16T16:52:10.623Z | 2026-05-16T16:52:10.623Z |
 | huthoinguyn | 1 | 2026-05-16T17:22:43.947Z | 2026-05-16T17:22:43.947Z |
+| soongyintong | 1 | 2026-05-16T23:47:04.809Z | 2026-05-16T23:47:04.809Z |
