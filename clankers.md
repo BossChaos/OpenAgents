@@ -8,3 +8,4 @@ Automated tracking of all Clankers PR contributors.
 | partyplatter08-lab | 2 | 2026-05-16T13:20:39.129Z | 2026-05-16T16:44:53.434Z |
 | shengtenghou4-star | 1 | 2026-05-16T13:27:12.096Z | 2026-05-16T13:27:12.096Z |
 | invisiblemonsters | 1 | 2026-05-16T16:21:06.703Z | 2026-05-16T16:21:06.703Z |
+| CuboYe | 1 | 2026-05-16T16:52:10.623Z | 2026-05-16T16:52:10.623Z |
