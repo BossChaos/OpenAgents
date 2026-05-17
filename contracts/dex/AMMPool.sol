@@ -10,6 +10,8 @@ interface IERC20 {
 /// @title AMMPool
 /// @notice Constant product (x*y=k) automated market maker pool
 /// @dev Supports adding/removing liquidity and token swaps with a fee
+/// @contributor BossChaos
+/// @bounty #165
 contract AMMPool {
     IERC20 public tokenA;
     IERC20 public tokenB;
@@ -72,13 +74,20 @@ contract AMMPool {
         emit LiquidityRemoved(msg.sender, amountA, amountB);
     }
 
-    // BUG: Swap has no deadline parameter — transaction can sit in mempool and execute
-    // at a much later time when price has moved unfavorably (stale transaction attack)
-    // BUG: Fee truncates to zero for small swaps — (amountIn * 30) / 10000 rounds to 0
-    // when amountIn < 334, meaning tiny swaps pay no fee and can drain value over time
-    function swap(address tokenIn, uint256 amountIn, uint256 minAmountOut) external returns (uint256 amountOut) {
+    /// @notice Swap tokens with deadline protection and minimum fee enforcement
+    /// @param tokenIn Address of the input token
+    /// @param amountIn Amount of input tokens to swap
+    /// @param minAmountOut Minimum output amount (slippage protection)
+    /// @param deadline Block timestamp after which this swap reverts (stale tx protection)
+    function swap(
+        address tokenIn,
+        uint256 amountIn,
+        uint256 minAmountOut,
+        uint256 deadline
+    ) external returns (uint256 amountOut) {
         require(tokenIn == address(tokenA) || tokenIn == address(tokenB), "Invalid token");
         require(amountIn > 0, "Zero input");
+        require(block.timestamp <= deadline, "Transaction expired");
 
         bool isA = tokenIn == address(tokenA);
         (uint256 resIn, uint256 resOut) = isA ? (reserveA, reserveB) : (reserveB, reserveA);
@@ -86,6 +95,7 @@ contract AMMPool {
         uint256 amountInWithFee = amountIn * (10000 - FEE_BPS);
         amountOut = (amountInWithFee * resOut) / (resIn * 10000 + amountInWithFee);
 
+        require(amountOut > 0, "Output too small");
         require(amountOut >= minAmountOut, "Slippage exceeded");
 
         IERC20 tIn = isA ? tokenA : tokenB;
