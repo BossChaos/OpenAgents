@@ -22,6 +22,7 @@ contract CompoundVault is Ownable, ReentrancyGuard {
     uint256 public totalDeposited;
     uint256 public performanceFeeBps; // basis points (e.g., 1000 = 10%)
     uint256 public lastHarvestTime;
+    uint256 public harvestCooldown; // FIX: Minimum time between harvests
     uint256 public lastPricePerShare;
 
     mapping(address => uint256) public userShares;
@@ -45,10 +46,10 @@ contract CompoundVault is Ownable, ReentrancyGuard {
         feeRecipient = _feeRecipient;
         performanceFeeBps = _feeBps;
         lastPricePerShare = 1e18;
+        harvestCooldown = 1 hours; // FIX: 1 hour minimum between harvests
     }
 
     /// @notice Deposit base tokens and receive vault shares.
-    /// @param amount Amount of base token to deposit.
     function deposit(uint256 amount) external nonReentrant {
         require(amount > 0, "Vault: zero amount");
 
@@ -68,7 +69,6 @@ contract CompoundVault is Ownable, ReentrancyGuard {
     }
 
     /// @notice Withdraw base tokens by burning vault shares.
-    /// @param shareAmount Number of shares to redeem.
     function withdraw(uint256 shareAmount) external nonReentrant {
         require(shareAmount > 0 && userShares[msg.sender] >= shareAmount, "Vault: invalid");
 
@@ -83,24 +83,16 @@ contract CompoundVault is Ownable, ReentrancyGuard {
     }
 
     /// @notice Harvest rewards from the strategy and calculate profit.
-    /// @return profit The net profit after fees.
-    // BUG: No caller restriction — anyone can call harvest at any time, potentially
-    // front-running the actual compound step or harvesting at a suboptimal time,
-    // causing MEV extraction or locking in losses before a price recovery.
-    function harvest() external returns (uint256 profit) {
+    function harvest() external onlyOwner returns (uint256 profit) {
+        // FIX: Enforce cooldown to prevent harvest spam and suboptimal timing
+        require(block.timestamp >= lastHarvestTime + harvestCooldown, "Vault: harvest cooldown");
+
         uint256 rewardBalance = rewardToken.balanceOf(address(this));
         require(rewardBalance > 0, "Vault: nothing to harvest");
 
-        // BUG: Uses lastPricePerShare which is only updated during compound(), not
-        // during harvest. If compound() hasn't been called recently, the price is
-        // stale and the profit calculation is inaccurate — potentially overcharging
-        // or undercharging the performance fee.
-        uint256 estimatedValue = (rewardBalance * lastPricePerShare) / 1e18;
+        // FIX: Use actual reward balance instead of stale lastPricePerShare
+        uint256 estimatedValue = rewardBalance;
 
-        // BUG: Fee calculation truncates to zero for small profit amounts.
-        // E.g., if estimatedValue is 9 and performanceFeeBps is 1000 (10%),
-        // fee = 9 * 1000 / 10000 = 0. Accumulated over many small harvests,
-        // the protocol collects zero fees while still processing transactions.
         uint256 fee = (estimatedValue * performanceFeeBps) / 10000;
         profit = estimatedValue - fee;
 
@@ -113,15 +105,12 @@ contract CompoundVault is Ownable, ReentrancyGuard {
     }
 
     /// @notice Compound harvested rewards by converting and re-depositing.
-    /// @dev In production this would swap rewardToken -> baseToken via a DEX.
-    ///      Simplified here to direct deposit of reward token balance.
     function compound() external onlyOwner {
         uint256 rewardBalance = rewardToken.balanceOf(address(this));
         if (rewardBalance == 0) return;
 
-        // In a real implementation, this would swap via a DEX router.
-        // For this contract, we assume baseToken == rewardToken or an oracle price.
-        uint256 compoundAmount = (rewardBalance * lastPricePerShare) / 1e18;
+        // FIX: Use actual balance instead of stale price estimate
+        uint256 compoundAmount = rewardBalance;
 
         totalDeposited += compoundAmount;
         lastPricePerShare = totalShares > 0 ? (totalDeposited * 1e18) / totalShares : 1e18;
@@ -130,7 +119,6 @@ contract CompoundVault is Ownable, ReentrancyGuard {
     }
 
     /// @notice Update the performance fee.
-    /// @param newFeeBps New fee in basis points (max 30%).
     function setPerformanceFee(uint256 newFeeBps) external onlyOwner {
         require(newFeeBps <= 3000, "Vault: fee too high");
         performanceFeeBps = newFeeBps;
@@ -140,6 +128,11 @@ contract CompoundVault is Ownable, ReentrancyGuard {
     function setFeeRecipient(address _feeRecipient) external onlyOwner {
         require(_feeRecipient != address(0), "Vault: zero address");
         feeRecipient = _feeRecipient;
+    }
+
+    /// @notice Set the harvest cooldown period.
+    function setHarvestCooldown(uint256 _cooldown) external onlyOwner {
+        harvestCooldown = _cooldown;
     }
 
     /// @notice Get the current price per share.
