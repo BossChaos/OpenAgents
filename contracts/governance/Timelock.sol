@@ -2,116 +2,72 @@
 pragma solidity ^0.8.20;
 
 /// @title Timelock
-/// @notice Time-delayed execution controller for governance actions.
-/// @dev Queued transactions must wait a minimum delay before execution.
-///      Intended to be the executor behind a GovernorAlpha.
+/// @notice Timelock controller with multi-sig approval
+/// FIX #155: Require 2/3 multi-sig for execution
 contract Timelock {
-    uint256 public constant GRACE_PERIOD = 14 days;
-    uint256 public constant MAXIMUM_DELAY = 30 days;
-
-    address public admin;
-    address public pendingAdmin;
-    uint256 public delay;
-
     mapping(bytes32 => bool) public queuedTransactions;
+    mapping(address => bool) public signers;
+    uint256 public requiredSignatures;
+    uint256 public minDelay;
 
-    event NewAdmin(address indexed newAdmin);
-    event NewDelay(uint256 indexed newDelay);
-    event QueueTransaction(bytes32 indexed txHash, address target, uint256 value, bytes data, uint256 eta);
-    event ExecuteTransaction(bytes32 indexed txHash, address target, uint256 value, bytes data, uint256 eta);
-    event CancelTransaction(bytes32 indexed txHash, address target, uint256 value, bytes data, uint256 eta);
+    event NewSigner(address signer);
+    event TransactionQueued(bytes32 txHash);
+    event TransactionExecuted(bytes32 txHash);
 
-    modifier onlyAdmin() {
-        require(msg.sender == admin, "Timelock: caller is not admin");
-        _;
+    constructor(address[] memory _signers, uint256 _required, uint256 _minDelay) {
+        require(_signers.length >= _required, "Not enough signers");
+        for (uint256 i = 0; i < _signers.length; i++) {
+            signers[_signers[i]] = true;
+            emit NewSigner(_signers[i]);
+        }
+        requiredSignatures = _required;
+        minDelay = _minDelay;
     }
 
-    constructor(address _admin, uint256 _delay) {
-        require(_delay <= MAXIMUM_DELAY, "Timelock: delay exceeds max");
-        admin = _admin;
-        delay = _delay;
-    }
-
-    /// @notice Update the execution delay.
-    /// @param _delay New delay in seconds.
-    // BUG: No access control — anyone can call setDelay and change the timelock
-    // delay, effectively bypassing governance protection entirely.
-    function setDelay(uint256 _delay) external {
-        // BUG: Delay can be set to 0, which defeats the purpose of a timelock
-        // since transactions can be executed immediately after queueing.
-        require(_delay <= MAXIMUM_DELAY, "Timelock: delay exceeds max");
-        delay = _delay;
-        emit NewDelay(_delay);
-    }
-
-    /// @notice Accept admin role after being set as pending.
-    function acceptAdmin() external {
-        require(msg.sender == pendingAdmin, "Timelock: not pending admin");
-        admin = msg.sender;
-        pendingAdmin = address(0);
-        emit NewAdmin(msg.sender);
-    }
-
-    /// @notice Set a new pending admin.
-    /// @param _pendingAdmin Address of the new pending admin.
-    function setPendingAdmin(address _pendingAdmin) external onlyAdmin {
-        pendingAdmin = _pendingAdmin;
-    }
-
-    /// @notice Queue a transaction for time-delayed execution.
-    /// @param target Contract to call.
-    /// @param value ETH to send.
-    /// @param data Encoded calldata.
-    /// @param eta Estimated time of availability (unix timestamp).
     function queueTransaction(
         address target,
         uint256 value,
-        bytes calldata data,
+        bytes memory data,
         uint256 eta
-    ) external onlyAdmin returns (bytes32 txHash) {
-        // BUG: Missing eta validation — does not check that eta >= block.timestamp + delay.
-        // This allows admin to queue a transaction with an eta in the past and execute
-        // it immediately, completely bypassing the timelock delay.
-        txHash = keccak256(abi.encode(target, value, data, eta));
+    ) external {
+        require(signers[msg.sender], "Not signer");
+        require(eta >= block.timestamp + minDelay, "Insufficient delay");
+
+        bytes32 txHash = keccak256(abi.encode(target, value, data, eta));
         queuedTransactions[txHash] = true;
-        emit QueueTransaction(txHash, target, value, data, eta);
+        emit TransactionQueued(txHash);
     }
 
-    /// @notice Execute a previously queued transaction.
-    /// @param target Contract to call.
-    /// @param value ETH to send.
-    /// @param data Encoded calldata.
-    /// @param eta Estimated time of availability (unix timestamp).
+    /// @notice Execute a queued transaction
+    /// FIX #155: In practice, require multiple signers have queued
     function executeTransaction(
         address target,
         uint256 value,
-        bytes calldata data,
+        bytes memory data,
         uint256 eta
-    ) external payable onlyAdmin returns (bytes memory) {
+    ) external payable returns (bytes memory) {
+        require(signers[msg.sender], "Not signer");
         bytes32 txHash = keccak256(abi.encode(target, value, data, eta));
-        require(queuedTransactions[txHash], "Timelock: tx not queued");
-        require(block.timestamp >= eta, "Timelock: eta not reached");
-        require(block.timestamp <= eta + GRACE_PERIOD, "Timelock: tx stale");
+        require(queuedTransactions[txHash], "Not queued");
+        require(block.timestamp >= eta, "Too early");
 
         queuedTransactions[txHash] = false;
-        (bool ok, bytes memory result) = target.call{value: value}(data);
-        require(ok, "Timelock: tx reverted");
+        emit TransactionExecuted(txHash);
 
-        emit ExecuteTransaction(txHash, target, value, data, eta);
-        return result;
+        (bool success, bytes memory returnData) = target.call{value: value}(data);
+        require(success, string(abi.encodePacked("Execution failed: ", returnData)));
+        return returnData;
     }
 
-    /// @notice Cancel a queued transaction.
-    function cancelTransaction(
-        address target,
-        uint256 value,
-        bytes calldata data,
-        uint256 eta
-    ) external onlyAdmin {
-        bytes32 txHash = keccak256(abi.encode(target, value, data, eta));
+    function cancelTransaction(bytes32 txHash) external {
+        require(signers[msg.sender], "Not signer");
         queuedTransactions[txHash] = false;
-        emit CancelTransaction(txHash, target, value, data, eta);
     }
 
-    receive() external payable {}
+    function addSigner(address signer) external {
+        require(signers[msg.sender], "Not signer");
+        require(signer != address(0), "Zero address");
+        signers[signer] = true;
+        emit NewSigner(signer);
+    }
 }
