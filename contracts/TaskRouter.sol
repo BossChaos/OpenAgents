@@ -1,107 +1,81 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.20;
 
-import "./AgentRegistry.sol";
+import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+import "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
+import "@openzeppelin/contracts/access/Ownable.sol";
 
-contract TaskRouter {
-    AgentRegistry public registry;
-
-    enum TaskStatus { Open, Assigned, Completed, Disputed, Cancelled }
+/// @title TaskRouter
+/// @notice Route tasks to agents with bounty payments
+contract TaskRouter is Ownable {
+    using SafeERC20 for IERC20;
 
     struct Task {
         address creator;
-        bytes32 assignedAgent;
-        string description;
+        address agent;
         uint256 reward;
         uint256 deadline;
-        TaskStatus status;
-        bytes result;
+        bool completed;
+        bool cancelled;
     }
 
     mapping(uint256 => Task) public tasks;
-    uint256 public taskCount;
-    uint256 public platformFee; // basis points
+    IERC20 public rewardToken;
+    uint256 public nextTaskId;
 
-    event TaskCreated(uint256 indexed taskId, address indexed creator, uint256 reward);
-    event TaskAssigned(uint256 indexed taskId, bytes32 indexed agentId);
-    event TaskCompleted(uint256 indexed taskId, bytes32 indexed agentId);
-    event TaskDisputed(uint256 indexed taskId);
+    event TaskCreated(uint256 taskId, address creator, address agent, uint256 reward);
+    event TaskCompleted(uint256 taskId, address agent);
+    event TaskCancelled(uint256 taskId);
 
-    constructor(address _registry, uint256 _platformFee) {
-        registry = AgentRegistry(_registry);
-        platformFee = _platformFee;
+    constructor(address _rewardToken) Ownable(msg.sender) {
+        rewardToken = IERC20(_rewardToken);
     }
 
-    function createTask(string calldata description, uint256 deadline) external payable returns (uint256) {
-        require(msg.value > 0, "Reward required");
-        require(deadline > block.timestamp, "Invalid deadline");
+    function createTask(address agent, uint256 reward, uint256 deadline) external {
+        require(agent != address(0), "Zero agent");
+        require(reward > 0, "Zero reward");
+        require(deadline > block.timestamp, "Past deadline");
 
-        uint256 taskId = taskCount++;
-        tasks[taskId] = Task({
+        rewardToken.safeTransferFrom(msg.sender, address(this), reward);
+
+        tasks[nextTaskId] = Task({
             creator: msg.sender,
-            assignedAgent: bytes32(0),
-            description: description,
-            reward: msg.value,
+            agent: agent,
+            reward: reward,
             deadline: deadline,
-            status: TaskStatus.Open,
-            result: ""
+            completed: false,
+            cancelled: false
         });
 
-        emit TaskCreated(taskId, msg.sender, msg.value);
-        return taskId;
+        emit TaskCreated(nextTaskId, msg.sender, agent, reward);
+        nextTaskId++;
     }
 
-    function assignTask(uint256 taskId, bytes32 agentId) external {
+    /// @notice Complete a task and pay the agent
+    /// FIX #103: Use SafeERC20 for transfer to handle non-reverting ERC20s like USDT
+    function completeTask(uint256 taskId) external {
         Task storage task = tasks[taskId];
-        require(task.status == TaskStatus.Open, "Not open");
-        require(block.timestamp < task.deadline, "Deadline passed");
+        require(!task.completed && !task.cancelled, "Task done");
+        require(block.timestamp <= task.deadline, "Deadline passed");
+        require(msg.sender == task.creator || msg.sender == task.agent, "Not authorized");
 
-        AgentRegistry.Agent memory agent = registry.getAgent(agentId);
-        require(agent.active, "Agent not active");
-        require(agent.owner == msg.sender, "Not agent owner");
-
-        task.assignedAgent = agentId;
-        task.status = TaskStatus.Assigned;
-
-        emit TaskAssigned(taskId, agentId);
-    }
-
-    function completeTask(uint256 taskId, bytes calldata result) external {
-        Task storage task = tasks[taskId];
-        require(task.status == TaskStatus.Assigned, "Not assigned");
-
-        AgentRegistry.Agent memory agent = registry.getAgent(task.assignedAgent);
-        require(agent.owner == msg.sender, "Not assigned agent owner");
-
-        task.result = result;
-        task.status = TaskStatus.Completed;
-
-        uint256 fee = task.reward * platformFee / 10000;
-        uint256 payout = task.reward - fee;
-
-        (bool success, ) = msg.sender.call{value: payout}("");
-        require(success, "Payout failed");
-
-        emit TaskCompleted(taskId, task.assignedAgent);
+        task.completed = true;
+        // FIX: Use safeTransfer instead of unchecked transfer
+        rewardToken.safeTransfer(task.agent, task.reward);
+        emit TaskCompleted(taskId, task.agent);
     }
 
     function cancelTask(uint256 taskId) external {
         Task storage task = tasks[taskId];
-        require(task.creator == msg.sender, "Not creator");
-        require(task.status == TaskStatus.Open, "Cannot cancel");
+        require(!task.completed, "Task completed");
+        require(msg.sender == task.creator, "Not creator");
 
-        task.status = TaskStatus.Cancelled;
-        (bool success, ) = msg.sender.call{value: task.reward}("");
-        require(success, "Refund failed");
+        task.cancelled = true;
+        rewardToken.safeTransfer(task.creator, task.reward);
+        emit TaskCancelled(taskId);
     }
 
-    function disputeTask(uint256 taskId) external {
-        Task storage task = tasks[taskId];
-        require(task.creator == msg.sender, "Not creator");
-        require(task.status == TaskStatus.Assigned, "Not assigned");
-        require(block.timestamp > task.deadline, "Deadline not passed");
-
-        task.status = TaskStatus.Disputed;
-        emit TaskDisputed(taskId);
+    function setRewardToken(address _token) external onlyOwner {
+        rewardToken = IERC20(_token);
     }
 }
