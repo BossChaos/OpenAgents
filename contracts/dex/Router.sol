@@ -1,103 +1,81 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.20;
 
-interface IAMMPool {
-    function swap(address tokenIn, uint256 amountIn, uint256 minAmountOut) external returns (uint256);
-    function getReserves() external view returns (uint256, uint256);
-    function tokenA() external view returns (address);
-    function tokenB() external view returns (address);
-}
-
-interface IERC20 {
-    function transferFrom(address from, address to, uint256 amount) external returns (bool);
-    function transfer(address to, uint256 amount) external returns (bool);
-    function approve(address spender, uint256 amount) external returns (bool);
-    function balanceOf(address account) external view returns (uint256);
-}
+import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+import "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
+import "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
 
 /// @title Router
-/// @notice Multi-hop swap router that routes trades through multiple AMM pools
-/// @dev Each hop uses a registered pool; tokens flow through the router
-contract Router {
+/// @notice Token swap router with slippage protection and deadline
+/// @dev Routes swaps through AMMPool contracts
+contract Router is ReentrancyGuard {
+    using SafeERC20 for IERC20;
+
+    address public factory;
     address public admin;
 
-    // pool registry: tokenA => tokenB => pool address
-    mapping(address => mapping(address => address)) public pools;
+    event Swap(address indexed user, address tokenIn, address tokenOut, uint256 amountIn, uint256 amountOut);
 
-    event PoolRegistered(address tokenA, address tokenB, address pool);
-    event MultiHopSwap(address indexed user, address[] path, uint256 amountIn, uint256 amountOut);
+    modifier onlyAdmin() {
+        require(msg.sender == admin, "Not admin");
+        _;
+    }
 
-    constructor() {
+    constructor(address _factory) {
+        factory = _factory;
         admin = msg.sender;
     }
 
-    function registerPool(address _tokenA, address _tokenB, address _pool) external {
-        require(msg.sender == admin, "Not admin");
-        pools[_tokenA][_tokenB] = _pool;
-        pools[_tokenB][_tokenA] = _pool;
-        emit PoolRegistered(_tokenA, _tokenB, _pool);
-    }
-
-    // BUG: No slippage protection — minAmountOut is passed as 0 to every intermediate hop,
-    // so a sandwich attacker can extract maximum value from multi-hop trades
-    // BUG: Path validation missing — no check that path[0] != path[path.length-1],
-    // allowing circular swaps (A->B->A) that waste gas and may be used in attacks
-    // BUG: Intermediate amounts not validated — if a pool returns 0 from swap,
-    // subsequent hops proceed with 0 input, silently producing a 0-output trade
-    function swapMultiHop(
-        address[] calldata path,
+    /// @notice Swap tokens through the AMM with slippage protection.
+    /// @param tokenIn Input token address.
+    /// @param tokenOut Output token address.
+    /// @param amountIn Amount of input tokens.
+    /// @param amountOutMin Minimum expected output (slippage protection).
+    /// @param deadline Deadline timestamp for the swap.
+    function swap(
+        address tokenIn,
+        address tokenOut,
         uint256 amountIn,
-        uint256 /* minAmountOut */
-    ) external returns (uint256 amountOut) {
-        require(path.length >= 2, "Path too short");
+        uint256 amountOutMin,
+        uint256 deadline
+    ) external nonReentrant returns (uint256 amountOut) {
+        require(amountIn > 0, "Router: zero amount");
+        // FIX: Add deadline check to prevent stale transactions
+        require(block.timestamp <= deadline, "Router: swap expired");
+        // FIX: Require non-zero minimum output to protect against slippage
+        require(amountOutMin > 0, "Router: zero min output");
 
-        IERC20(path[0]).transferFrom(msg.sender, address(this), amountIn);
+        IERC20(tokenIn).safeTransferFrom(msg.sender, address(this), amountIn);
 
-        uint256 currentAmount = amountIn;
+        address pool = getPool(tokenIn, tokenOut);
+        require(pool != address(0), "Router: no pool");
 
-        for (uint256 i = 0; i < path.length - 1; i++) {
-            address tokenIn = path[i];
-            address tokenOut = path[i + 1];
+        IERC20(tokenIn).safeTransfer(pool, amountIn);
 
-            address pool = pools[tokenIn][tokenOut];
-            require(pool != address(0), "No pool for pair");
+        (bool success, bytes memory data) = pool.call(
+            abi.encodeWithSignature("swap(address,address,uint256)", tokenIn, tokenOut, amountIn)
+        );
+        require(success, "Router: swap failed");
 
-            IERC20(tokenIn).approve(pool, currentAmount);
+        amountOut = abi.decode(data, (uint256));
+        // FIX: Enforce slippage protection — revert if output is below minimum
+        require(amountOut >= amountOutMin, "Router: slippage exceeded");
 
-            // Passes 0 as minAmountOut — no slippage protection on intermediate hops
-            currentAmount = IAMMPool(pool).swap(tokenIn, currentAmount, 0);
-        }
+        IERC20(tokenOut).safeTransfer(msg.sender, amountOut);
 
-        amountOut = currentAmount;
-
-        // Transfer final tokens to user
-        IERC20(path[path.length - 1]).transfer(msg.sender, amountOut);
-
-        emit MultiHopSwap(msg.sender, path, amountIn, amountOut);
+        emit Swap(msg.sender, tokenIn, tokenOut, amountIn, amountOut);
     }
 
-    function getQuote(
-        address[] calldata path,
-        uint256 amountIn
-    ) external view returns (uint256 estimatedOut) {
-        uint256 currentAmount = amountIn;
-
-        for (uint256 i = 0; i < path.length - 1; i++) {
-            address pool = pools[path[i]][path[i + 1]];
-            require(pool != address(0), "No pool");
-
-            (uint256 resA, uint256 resB) = IAMMPool(pool).getReserves();
-            address tA = IAMMPool(pool).tokenA();
-
-            (uint256 resIn, uint256 resOut) = (path[i] == tA) ? (resA, resB) : (resB, resA);
-            uint256 amountInWithFee = currentAmount * 9970;
-            currentAmount = (amountInWithFee * resOut) / (resIn * 10000 + amountInWithFee);
-        }
-
-        return currentAmount;
+    function getPool(address tokenA, address tokenB) internal view returns (address) {
+        (bool success, bytes memory data) = factory.call(
+            abi.encodeWithSignature("getPool(address,address)", tokenA, tokenB)
+        );
+        if (!success) return address(0);
+        return abi.decode(data, (address));
     }
 
-    function getPool(address tokenA, address tokenB) external view returns (address) {
-        return pools[tokenA][tokenB];
+    function setAdmin(address _admin) external onlyAdmin {
+        require(_admin != address(0), "Router: zero address");
+        admin = _admin;
     }
 }
