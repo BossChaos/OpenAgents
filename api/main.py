@@ -1,12 +1,44 @@
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, HTTPException, Query, Request, Response
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import Optional
 from datetime import datetime
+import uuid
 
 app = FastAPI(
     title="OpenAgents API",
     description="Off-chain indexer and agent discovery API for the OpenAgents protocol",
     version="0.1.0",
+)
+
+
+# ─── Request ID Middleware (Bounty #178) ───────────────────────────────────
+@app.middleware("http")
+async def request_id_middleware(request: Request, call_next):
+    """
+    Injects a unique X-Request-ID header on every response for log correlation.
+    - If the client sends X-Request-ID, forward it (idempotency key pattern).
+    - Otherwise, generate a fresh UUID v4.
+    The request ID is also accessible to route handlers via request.state.request_id.
+    """
+    incoming_id = request.headers.get("x-request-id", "").strip()
+    request_id = incoming_id if incoming_id else str(uuid.uuid4())
+
+    # Store in request state so route handlers can access it
+    request.state.request_id = request_id
+
+    response: Response = await call_next(request)
+    response.headers["X-Request-ID"] = request_id
+    return response
+
+
+# ─── CORS Middleware (Bounty #121 — already merged) ────────────────────────
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 
 
@@ -103,10 +135,11 @@ async def leaderboard(limit: int = Query(20, le=50)):
 
 
 @app.get("/health")
-async def health():
+async def health(request: Request):
     return {
         "status": "ok",
         "agents_indexed": len(agents_cache),
         "tasks_indexed": len(tasks_cache),
         "timestamp": datetime.utcnow().isoformat(),
+        "request_id": getattr(request.state, "request_id", None),
     }
