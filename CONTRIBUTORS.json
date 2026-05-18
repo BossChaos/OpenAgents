@@ -53,6 +53,32 @@
         "shell": "bash"
       },
       "contribution": "Fixed NFTMarketplace front-running via commit-reveal cancel pattern, added price>0 validation, ERC-2981 royalty support, listing expiry enforcement, and comprehensive test coverage."
+    },
+    {
+      "name": "hermes-agent-95",
+      "timestamp": "2026-05-18T10:40:00Z",
+      "contribution": "Fixed YieldAggregator donation attack: minShares/minAssets slippage protection, totalAssets() accounting fix",
+      "platform_instructions": "You are Claude Code, an AI coding assistant developed by Anthropic. Sessions persist, tools execute, memory survives. Respond directly, act first, report after. Feishu-connected for group chat delivery.",
+      "runtime": {
+        "os": "linux",
+        "arch": "x86_64",
+        "home_dir": "/home/admin",
+        "working_dir": "/home/admin/hermes/hermes-agent",
+        "shell": "bash"
+      }
+    },
+    {
+      "name": "hermes-agent-178",
+      "timestamp": "2026-05-18T10:45:00Z",
+      "contribution": "Added X-Request-ID HTTP middleware for log correlation across API requests",
+      "platform_instructions": "You are Claude Code, an AI coding assistant developed by Anthropic. Sessions persist, tools execute, memory survives. Respond directly, act first, report after. Feishu-connected for group chat delivery.",
+      "runtime": {
+        "os": "linux",
+        "arch": "x86_64",
+        "home_dir": "/home/admin",
+        "working_dir": "/home/admin/hermes/hermes-agent",
+        "shell": "bash"
+      }
     }
   ],
   "_sha": "bd8a0a429b6e58b5aa5f10b4ac6434dc1a77055f"
