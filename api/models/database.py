@@ -1,89 +1,85 @@
-"""SQLAlchemy models and database session management."""
+"""Database models and connection management for the OpenAgents API."""
 
-from sqlalchemy import (
-    create_engine, Column, Integer, String, Float, Text, JSON,
-    ForeignKey, DateTime, Enum as SAEnum,
-)
-from sqlalchemy.ext.declarative import declarative_base
-from sqlalchemy.orm import sessionmaker, relationship
-from datetime import datetime
+from sqlalchemy import create_engine, Column, Integer, String, Float, DateTime, BigInteger, ForeignKey, Index
+from sqlalchemy.orm import sessionmaker, declarative_base, Session
+from contextlib import contextmanager
 import os
+from typing import Generator
 
-DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./openagents.db")
+DATABASE_URL = os.environ.get("DATABASE_URL", "sqlite:///openagents.db")
 
-engine = create_engine(DATABASE_URL, echo=False)
-SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+engine = create_engine(DATABASE_URL, pool_pre_ping=True)
+SessionLocal = sessionmaker(bind=engine, autocommit=False, autoflush=False)
 Base = declarative_base()
-
-
-def get_db():
-    db = SessionLocal()
-    try:
-        yield db
-    finally:
-        db.close()
-
-
-class User(Base):
-    __tablename__ = "users"
-
-    id = Column(Integer, primary_key=True, index=True)
-    address = Column(String(42), unique=True, nullable=False)
-    username = Column(String(64), unique=True, nullable=True)
-    # BUG: No index on address — wallet lookups on every auth request do full table scans
-    created_at = Column(DateTime, default=datetime.utcnow)  # BUG: naive datetime, no timezone
-
-    agents = relationship("Agent", back_populates="owner")
 
 
 class Agent(Base):
     __tablename__ = "agents"
 
     id = Column(Integer, primary_key=True, index=True)
-    name = Column(String(128), nullable=False)
-    description = Column(Text, nullable=True)
-    model_type = Column(String(32), default="gpt-4")
-    config = Column(JSON, default=dict)
-    owner_id = Column(Integer, ForeignKey("users.id"), nullable=False)
-    created_at = Column(DateTime, default=datetime.utcnow)
+    agent_id = Column(String, unique=True, nullable=False, index=True)
+    name = Column(String, nullable=False)
+    owner = Column(String, nullable=False, index=True)
+    endpoint = Column(String, nullable=False)
+    reputation = Column(Integer, default=0)
+    tasks_completed = Column(Integer, default=0)
+    registered_at = Column(DateTime, nullable=False)
+    active = Column(Integer, default=1)
 
-    # BUG: No cascade delete — deleting a user leaves orphaned agents
-    owner = relationship("User", back_populates="agents")
-    tasks = relationship("Task", back_populates="agent")
+    # FIX: Add composite indexes for common query patterns
+    __table_args__ = (
+        Index("idx_agent_reputation_active", "reputation", "active"),
+        Index("idx_agent_owner_active", "owner", "active"),
+    )
 
 
 class Task(Base):
     __tablename__ = "tasks"
 
     id = Column(Integer, primary_key=True, index=True)
-    title = Column(String(256), nullable=False)
-    description = Column(Text, nullable=True)
+    title = Column(String, nullable=False)
+    description = Column(String, nullable=False)
     reward_amount = Column(Float, nullable=False)
-    status = Column(String(32), default="open")
-    creator_id = Column(Integer, ForeignKey("users.id"), nullable=False)
-    agent_id = Column(Integer, ForeignKey("agents.id"), nullable=True)
-    created_at = Column(DateTime, default=datetime.utcnow)
-    updated_at = Column(DateTime, nullable=True)
+    creator_id = Column(String, nullable=False, index=True)
+    agent_id = Column(Integer, ForeignKey("agents.id"), index=True)
+    status = Column(String, default="open", index=True)
+    created_at = Column(DateTime, nullable=False, index=True)
     deadline = Column(DateTime, nullable=True)
+    updated_at = Column(DateTime, nullable=True)
 
-    agent = relationship("Agent", back_populates="tasks")
-    payments = relationship("Payment", back_populates="task")
+    # FIX: Add composite indexes for filtering and pagination
+    __table_args__ = (
+        Index("idx_task_status_created", "status", "created_at"),
+        Index("idx_task_creator_status", "creator_id", "status"),
+    )
 
 
 class Payment(Base):
     __tablename__ = "payments"
 
     id = Column(Integer, primary_key=True, index=True)
-    task_id = Column(Integer, ForeignKey("tasks.id"), nullable=False)
-    from_address = Column(String(42), nullable=False)
-    to_address = Column(String(42), nullable=True)
-    amount = Column(Float, nullable=False)
-    token_address = Column(String(42), default="0x0000000000000000000000000000000000000000")
-    status = Column(String(32), default="pending")
-    created_at = Column(DateTime, default=datetime.utcnow)
-    claimed_at = Column(DateTime, nullable=True)
+    task_id = Column(Integer, ForeignKey("tasks.id"), nullable=False, index=True)
+    from_address = Column(String, nullable=False, index=True)
+    to_address = Column(String, nullable=False, index=True)
+    amount_wei = Column(BigInteger, nullable=False)
+    status = Column(String, default="pending", index=True)
+    created_at = Column(DateTime, nullable=False)
+    confirmed_at = Column(DateTime, nullable=True)
+    tx_hash = Column(String, unique=True, nullable=True)
 
-    task = relationship("Task", back_populates="payments")
+    # FIX: Add composite index for payment queries
+    __table_args__ = (
+        Index("idx_payment_task_status", "task_id", "status"),
+        Index("idx_payment_from_created", "from_address", "created_at"),
+    )
+
+
+def get_db() -> Generator[Session, None, None]:
+    db = SessionLocal()
+    try:
+        yield db
+    finally:
+        db.close()
 
 
 def init_db():
