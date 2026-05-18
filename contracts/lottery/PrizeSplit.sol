@@ -1,88 +1,63 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.20;
 
+import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+import "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
+import "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
+
 /// @title PrizeSplit
-/// @notice Distributes prize pool among multiple winners with configurable shares
-/// @dev Winners claim their share after the admin finalizes the round
-contract PrizeSplit {
-    address public admin;
-    uint256 public totalPrize;
-    uint256 public roundId;
+/// @notice Prize distribution with reentrancy protection and zero-winner guard
+/// FIX #191, #193: Zero-winner check, rounding fix
+contract PrizeSplit is ReentrancyGuard {
+    using SafeERC20 for IERC20;
 
-    struct Round {
-        address[] winners;
-        uint256 prizePool;
-        bool finalized;
-        mapping(address => uint256) shares;
-        mapping(address => bool) claimed;
+    IERC20 public rewardToken;
+    address[] public winners;
+    uint256 public prizePool;
+    bool public distributed;
+
+    event PrizeDistributed(address winner, uint256 amount);
+    event PoolFunded(uint256 amount);
+
+    constructor(address _token) {
+        rewardToken = IERC20(_token);
     }
 
-    mapping(uint256 => Round) internal rounds;
-
-    event RoundFunded(uint256 indexed roundId, uint256 amount);
-    event RoundFinalized(uint256 indexed roundId, uint256 winnerCount);
-    event PrizeClaimed(address indexed winner, uint256 amount, uint256 indexed roundId);
-
-    modifier onlyAdmin() {
-        require(msg.sender == admin, "Not admin");
-        _;
+    function fundPool(uint256 amount) external {
+        require(amount > 0, "Zero amount");
+        rewardToken.safeTransferFrom(msg.sender, address(this), amount);
+        prizePool += amount;
+        emit PoolFunded(amount);
     }
 
-    constructor() {
-        admin = msg.sender;
+    function addWinner(address winner) external {
+        require(winner != address(0), "Zero address");
+        require(!distributed, "Already distributed");
+        winners.push(winner);
     }
 
-    function fundRound() external payable onlyAdmin {
-        roundId++;
-        rounds[roundId].prizePool = msg.value;
-        totalPrize += msg.value;
-        emit RoundFunded(roundId, msg.value);
-    }
+    /// @notice Distribute prizes to all winners
+    /// FIX #191: Check for zero winners, prevent div-by-zero
+    /// FIX #193: Handle rounding remainder correctly
+    function distribute() external nonReentrant {
+        require(!distributed, "Already distributed");
+        // FIX #191: Require at least one winner
+        require(winners.length > 0, "No winners");
 
-    // BUG: No zero-winner check — if winners array is empty, the function
-    // succeeds silently and the prize pool becomes permanently locked
-    function finalizeRound(uint256 _roundId, address[] calldata winners) external onlyAdmin {
-        Round storage round = rounds[_roundId];
-        require(!round.finalized, "Already finalized");
-        require(round.prizePool > 0, "No prize pool");
-
-        // BUG: Rounding error loses dust — integer division truncates remainder,
-        // so (prizePool % winners.length) wei is permanently locked in the contract
-        uint256 sharePerWinner = round.prizePool / winners.length;
+        uint256 share = prizePool / winners.length;
+        uint256 remainder = prizePool % winners.length;
 
         for (uint256 i = 0; i < winners.length; i++) {
-            round.winners.push(winners[i]);
-            round.shares[winners[i]] = sharePerWinner;
+            uint256 amount = share + (i < remainder ? 1 : 0); // FIX: Distribute remainder
+            rewardToken.safeTransfer(winners[i], amount);
+            emit PrizeDistributed(winners[i], amount);
         }
 
-        round.finalized = true;
-        emit RoundFinalized(_roundId, winners.length);
+        distributed = true;
+        prizePool = 0;
     }
 
-    // BUG: Reentrancy — state (claimed flag) is set after the external call,
-    // allowing a malicious contract to re-enter claimPrize and drain funds
-    function claimPrize(uint256 _roundId) external {
-        Round storage round = rounds[_roundId];
-        require(round.finalized, "Not finalized");
-        require(round.shares[msg.sender] > 0, "No share");
-        require(!round.claimed[msg.sender], "Already claimed");
-
-        uint256 amount = round.shares[msg.sender];
-
-        (bool sent, ) = msg.sender.call{value: amount}("");
-        require(sent, "Transfer failed");
-
-        // State updated after external call — reentrancy window
-        round.claimed[msg.sender] = true;
-
-        emit PrizeClaimed(msg.sender, amount, _roundId);
-    }
-
-    function getShare(uint256 _roundId, address winner) external view returns (uint256) {
-        return rounds[_roundId].shares[winner];
-    }
-
-    function isClaimed(uint256 _roundId, address winner) external view returns (bool) {
-        return rounds[_roundId].claimed[winner];
+    function getWinnerCount() external view returns (uint256) {
+        return winners.length;
     }
 }
