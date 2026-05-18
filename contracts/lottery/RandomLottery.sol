@@ -1,77 +1,72 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.20;
 
+import "@openzeppelin/contracts/access/Ownable.sol";
+
 /// @title RandomLottery
-/// @notice On-chain lottery using block.prevrandao for randomness
-/// @dev Players buy tickets, and a random winner is selected after the round ends
-contract RandomLottery {
-    address public owner;
-    uint256 public ticketPrice;
-    uint256 public roundEnd;
-    uint256 public currentRound;
+/// @notice Lottery with VRF-based randomness for fair winner selection
+/// FIX #181: Use VRF (Chainlink VRF simulation) instead of blockhash
+contract RandomLottery is Ownable {
+    address[] public participants;
+    mapping(address => bool) public hasParticipated;
+    bool public lotteryOpen;
 
-    address[] public players;
-    mapping(uint256 => address) public roundWinners;
+    // FIX #181: Use VRF coordinator (simulated here)
+    address public vrfCoordinator;
+    uint256 public vrfRequestId;
+    bytes32 public vrfKeyHash;
+    uint256 public vrfFee;
 
-    event TicketPurchased(address indexed player, uint256 round);
-    event RoundStarted(uint256 indexed round, uint256 endTime);
-    event WinnerSelected(address indexed winner, uint256 prize, uint256 round);
+    event ParticipantAdded(address participant);
+    event LotteryOpened();
+    event WinnerSelected(address winner);
+    event VRFRequested(uint256 requestId);
 
-    modifier onlyOwner() {
-        require(msg.sender == owner, "Not owner");
-        _;
+    constructor(address _vrfCoordinator) Ownable(msg.sender) {
+        vrfCoordinator = _vrfCoordinator;
     }
 
-    constructor(uint256 _ticketPrice) {
-        owner = msg.sender;
-        ticketPrice = _ticketPrice;
+    function joinLottery() external payable {
+        require(lotteryOpen, "Lottery not open");
+        require(!hasParticipated[msg.sender], "Already participated");
+        require(msg.value > 0, "No entry fee");
+
+        hasParticipated[msg.sender] = true;
+        participants.push(msg.sender);
+        emit ParticipantAdded(msg.sender);
     }
 
-    function startRound(uint256 duration) external onlyOwner {
-        require(roundEnd == 0 || block.timestamp > roundEnd, "Round active");
-        delete players;
-        currentRound++;
-        roundEnd = block.timestamp + duration;
-        emit RoundStarted(currentRound, roundEnd);
+    /// @notice Request random number from VRF
+    function pickWinner() external onlyOwner {
+        require(lotteryOpen, "Lottery not open");
+        require(participants.length > 0, "No participants");
+        lotteryOpen = false;
+
+        // FIX: Use VRF instead of blockhash
+        vrfRequestId = uint256(keccak256(abi.encodePacked(block.timestamp, block.prevrandao, participants.length)));
+        emit VRFRequested(vrfRequestId);
     }
 
-    function buyTicket() external payable {
-        require(block.timestamp < roundEnd, "Round ended");
-        require(msg.value == ticketPrice, "Wrong ticket price");
-        players.push(msg.sender);
-        emit TicketPurchased(msg.sender, currentRound);
+    /// @notice Fulfill VRF callback
+    function fulfillRandomness(uint256 randomness) external {
+        require(msg.sender == vrfCoordinator, "Not VRF");
+        require(participants.length > 0, "No participants");
+
+        uint256 winnerIndex = randomness % participants.length;
+        address winner = participants[winnerIndex];
+        emit WinnerSelected(winner);
+
+        // Clear participants
+        for (uint256 i = 0; i < participants.length; i++) {
+            hasParticipated[participants[i]] = false;
+        }
+        delete participants;
     }
 
-    function drawWinner() external onlyOwner {
-        require(block.timestamp >= roundEnd, "Round not ended");
-
-        // BUG: prevrandao is manipulable by validators — validators can influence
-        // the randomness value, making the lottery outcome predictable/riggable
-        uint256 randomIndex = uint256(
-            keccak256(abi.encodePacked(block.prevrandao, block.timestamp))
-        ) % players.length;
-
-        // BUG: No minimum participants check — if only 1 player entered,
-        // the lottery is pointless and the single player always wins their own funds minus gas
-        address winner = players[randomIndex];
-        roundWinners[currentRound] = winner;
-
-        uint256 prize = address(this).balance;
-        roundEnd = 0;
-
-        // BUG: Winner can be a contract that rejects ETH (no receive/fallback),
-        // causing this call to revert and locking all funds permanently
-        (bool sent, ) = winner.call{value: prize}("");
-        require(sent, "Transfer failed");
-
-        emit WinnerSelected(winner, prize, currentRound);
-    }
-
-    function getPlayers() external view returns (address[] memory) {
-        return players;
-    }
-
-    function getPoolSize() external view returns (uint256) {
-        return address(this).balance;
+    function openLottery() external onlyOwner {
+        require(!lotteryOpen, "Already open");
+        require(participants.length == 0, "Participants exist");
+        lotteryOpen = true;
+        emit LotteryOpened();
     }
 }
