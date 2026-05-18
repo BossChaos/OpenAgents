@@ -9,8 +9,9 @@ import "@openzeppelin/contracts/token/ERC20/extensions/ERC20Burnable.sol";
 /// @dev Used as the native token for the OpenAgents platform.
 contract AgentToken is ERC20, ERC20Burnable {
     address public owner;
-    // BUG: No max supply cap — tokens can be minted infinitely, leading to
-    // unbounded inflation and devaluation of existing holders' tokens.
+    // FIX: Added MAX_SUPPLY cap — prevents unbounded inflation. Only owner can mint
+    // up to the cap, protecting existing holders from token dilution.
+    uint256 public constant MAX_SUPPLY = 1_000_000_000e18; // 1B tokens
 
     bytes32 public constant PERMIT_TYPEHASH = keccak256(
         "Permit(address owner,address spender,uint256 value,uint256 nonce,uint256 deadline)"
@@ -19,12 +20,14 @@ contract AgentToken is ERC20, ERC20Burnable {
     mapping(address => uint256) public nonces;
 
     event OwnershipTransferred(address indexed previousOwner, address indexed newOwner);
+    event Minted(address indexed to, uint256 amount, uint256 totalSupply);
 
     constructor(
         string memory name_,
         string memory symbol_,
         uint256 initialSupply
     ) ERC20(name_, symbol_) {
+        require(initialSupply <= MAX_SUPPLY, "AgentToken: exceeds max supply");
         owner = msg.sender;
         _mint(msg.sender, initialSupply);
         DOMAIN_SEPARATOR = keccak256(abi.encode(
@@ -36,19 +39,25 @@ contract AgentToken is ERC20, ERC20Burnable {
         ));
     }
 
+    modifier onlyOwner() {
+        require(msg.sender == owner, "AgentToken: not owner");
+        _;
+    }
+
     /// @notice Mint new tokens to a recipient.
     /// @param to Recipient address.
     /// @param amount Amount of tokens to mint.
-    // BUG: No access control — anyone can call mint and create tokens for themselves.
-    // Should be restricted to owner or a minter role.
-    function mint(address to, uint256 amount) external {
+    /// @dev FIX 1: Added onlyOwner access control — only the owner can mint tokens.
+    /// @dev FIX 2: Added MAX_SUPPLY check — total supply cannot exceed the cap.
+    function mint(address to, uint256 amount) external onlyOwner {
+        require(totalSupply() + amount <= MAX_SUPPLY, "AgentToken: exceeds max supply");
         _mint(to, amount);
+        emit Minted(to, amount, totalSupply());
     }
 
     /// @notice Transfer ownership of the contract.
     /// @param newOwner The new owner address.
-    function transferOwnership(address newOwner) external {
-        require(msg.sender == owner, "AgentToken: not owner");
+    function transferOwnership(address newOwner) external onlyOwner {
         require(newOwner != address(0), "AgentToken: zero address");
         emit OwnershipTransferred(owner, newOwner);
         owner = newOwner;
@@ -62,6 +71,8 @@ contract AgentToken is ERC20, ERC20Burnable {
     /// @param v ECDSA recovery byte.
     /// @param r ECDSA r value.
     /// @param s ECDSA s value.
+    /// @dev FIX: Added deadline check — expired permits are rejected, preventing
+    /// old signatures from being replayed indefinitely.
     function permit(
         address _owner,
         address spender,
@@ -71,8 +82,8 @@ contract AgentToken is ERC20, ERC20Burnable {
         bytes32 r,
         bytes32 s
     ) external {
-        // BUG: Deadline is not checked — expired permits are still accepted, allowing
-        // old signatures to be used indefinitely. Should require(block.timestamp <= deadline).
+        require(block.timestamp <= deadline, "AgentToken: permit expired");
+
         bytes32 structHash = keccak256(abi.encode(
             PERMIT_TYPEHASH,
             _owner,

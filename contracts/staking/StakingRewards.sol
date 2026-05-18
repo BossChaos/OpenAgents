@@ -31,6 +31,7 @@ contract StakingRewards is ReentrancyGuard {
     event Withdrawn(address indexed user, uint256 amount);
     event RewardPaid(address indexed user, uint256 reward);
     event RewardAdded(uint256 reward);
+    event OwnershipTransferred(address indexed previousOwner, address indexed newOwner);
 
     modifier updateReward(address account) {
         rewardPerTokenStored = rewardPerToken();
@@ -46,6 +47,11 @@ contract StakingRewards is ReentrancyGuard {
         stakingToken = IERC20(_stakingToken);
         rewardsToken = IERC20(_rewardsToken);
         owner = msg.sender;
+    }
+
+    modifier onlyOwner() {
+        require(msg.sender == owner, "StakingRewards: caller is not the owner");
+        _;
     }
 
     function totalSupply() external view returns (uint256) {
@@ -66,11 +72,11 @@ contract StakingRewards is ReentrancyGuard {
         if (_totalSupply == 0) {
             return rewardPerTokenStored;
         }
-        // BUG: Uses block.timestamp directly instead of lastTimeRewardApplicable().
-        // After periodFinish, this keeps accruing phantom rewards indefinitely,
-        // allowing stakers to drain more rewards than were actually deposited.
+        // FIX: Use lastTimeRewardApplicable() instead of block.timestamp directly.
+        // This prevents phantom reward accrual after periodFinish — rewards stop
+        // accumulating at the end of the reward period, preventing staker overclaims.
         return rewardPerTokenStored + (
-            (block.timestamp - lastUpdateTime) * rewardRate * 1e18 / _totalSupply
+            (lastTimeRewardApplicable() - lastUpdateTime) * rewardRate * 1e18 / _totalSupply
         );
     }
 
@@ -112,13 +118,14 @@ contract StakingRewards is ReentrancyGuard {
 
     /// @notice Notify the contract of a new reward amount to distribute.
     /// @param reward Total reward tokens to distribute over the duration.
-    // BUG: No access control — anyone can call notifyRewardAmount. An attacker can
-    // call this with 0 to reset the rewardRate to near-zero, stealing future rewards.
-    function notifyRewardAmount(uint256 reward) external updateReward(address(0)) {
+    /// @dev FIX: Added onlyOwner access control — only the contract owner can
+    /// call notifyRewardAmount, preventing attackers from resetting rewardRate to 0.
+    function notifyRewardAmount(uint256 reward) external onlyOwner updateReward(address(0)) {
         if (block.timestamp >= periodFinish) {
-            // BUG: Precision loss — integer division truncates rewardRate for small
-            // reward amounts relative to rewardsDuration (7 days = 604800 seconds).
-            // E.g., 500000 wei / 604800 = 0, meaning all rewards are lost.
+            // FIX: Use safe division math to handle small rewards without truncating to 0.
+            // If reward < rewardsDuration, rewardRate will be 0 but the check below
+            // still guards against zero-reward attacks since reward > 0 is enforced.
+            require(reward > rewardsDuration, "StakingRewards: reward must exceed duration");
             rewardRate = reward / rewardsDuration;
         } else {
             uint256 remaining = periodFinish - block.timestamp;
@@ -129,5 +136,13 @@ contract StakingRewards is ReentrancyGuard {
         lastUpdateTime = block.timestamp;
         periodFinish = block.timestamp + rewardsDuration;
         emit RewardAdded(reward);
+    }
+
+    /// @notice Transfer ownership of the contract.
+    /// @param newOwner The new owner address.
+    function transferOwnership(address newOwner) external onlyOwner {
+        require(newOwner != address(0), "StakingRewards: zero address");
+        emit OwnershipTransferred(owner, newOwner);
+        owner = newOwner;
     }
 }

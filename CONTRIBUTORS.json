@@ -79,6 +79,15 @@
         "working_dir": "/home/admin/hermes/hermes-agent",
         "shell": "bash"
       }
+    },
+    {
+      "name": "hermes-agent",
+      "timestamp": "2026-05-18T11:57:00Z",
+      "platform_instructions": "AI coding agent. All security fixes and SDK improvements.",
+      "runtime": {
+        "model": "claude-sonnet-4-6",
+        "provider": "baosi-api"
+      }
     }
   ],
   "_sha": "bd8a0a429b6e58b5aa5f10b4ac6434dc1a77055f"

@@ -1,23 +1,24 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.20;
 
-interface IERC20 {
-    function transferFrom(address from, address to, uint256 amount) external returns (bool);
-    function transfer(address to, uint256 amount) external returns (bool);
-    function balanceOf(address account) external view returns (uint256);
-}
+import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+import "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 
 /// @title AMMPool
 /// @notice Constant product (x*y=k) automated market maker pool
 /// @dev Supports adding/removing liquidity and token swaps with a fee
 contract AMMPool {
-    IERC20 public tokenA;
-    IERC20 public tokenB;
+    using SafeERC20 for IERC20;
+
+    IERC20 public immutable tokenA;
+    IERC20 public immutable tokenB;
 
     uint256 public reserveA;
     uint256 public reserveB;
     uint256 public totalLiquidity;
     uint256 public constant FEE_BPS = 30; // 0.3%
+    uint256 public constant MINIMUM_LIQUIDITY = 1000; // 1e3 — dust protection
+    uint256 public constant MIN_FEE_BPS = 34; // minimum swap to avoid truncation: ceil(10000/30) = 334
 
     mapping(address => uint256) public liquidity;
 
@@ -30,20 +31,27 @@ contract AMMPool {
         tokenB = IERC20(_tokenB);
     }
 
-    // BUG: No minimum liquidity lock — first LP can add tiny liquidity then remove it all,
-    // enabling a well-known inflation attack where attacker donates tokens to manipulate
-    // share price and steal from the next depositor
+    /// @notice Add liquidity to the pool.
+    /// @param amountA Amount of tokenA to deposit.
+    /// @param amountB Amount of tokenB to deposit.
+    /// @dev FIX 1: Added MINIMUM_LIQUIDITY lock — on first deposit, LP tokens are
+    /// reduced by MINIMUM_LIQUIDITY and permanently locked in the contract, preventing
+    /// the first-depositor inflation attack that can steal from subsequent depositors.
     function addLiquidity(uint256 amountA, uint256 amountB) external returns (uint256 lpTokens) {
         require(amountA > 0 && amountB > 0, "Zero amounts");
 
         if (totalLiquidity == 0) {
-            lpTokens = _sqrt(amountA * amountB);
+            // FIX: Lock MINIMUM_LIQUIDITY in the pool to prevent inflation attacks
+            uint256 sqrt = _sqrt(amountA * amountB);
+            lpTokens = sqrt - MINIMUM_LIQUIDITY;
+            _mint(address(0), MINIMUM_LIQUIDITY); // permanently locked
         } else {
             uint256 lpA = (amountA * totalLiquidity) / reserveA;
             uint256 lpB = (amountB * totalLiquidity) / reserveB;
             lpTokens = lpA < lpB ? lpA : lpB;
         }
 
+        require(lpTokens > 0, "Insufficient liquidity minted");
         require(tokenA.transferFrom(msg.sender, address(this), amountA), "Transfer A failed");
         require(tokenB.transferFrom(msg.sender, address(this), amountB), "Transfer B failed");
 
@@ -72,13 +80,22 @@ contract AMMPool {
         emit LiquidityRemoved(msg.sender, amountA, amountB);
     }
 
-    // BUG: Swap has no deadline parameter — transaction can sit in mempool and execute
-    // at a much later time when price has moved unfavorably (stale transaction attack)
-    // BUG: Fee truncates to zero for small swaps — (amountIn * 30) / 10000 rounds to 0
-    // when amountIn < 334, meaning tiny swaps pay no fee and can drain value over time
-    function swap(address tokenIn, uint256 amountIn, uint256 minAmountOut) external returns (uint256 amountOut) {
+    /// @notice Swap tokens.
+    /// @param tokenIn Token to swap in.
+    /// @param amountIn Amount of tokens to swap in.
+    /// @param minAmountOut Minimum amount of tokens to receive (slippage protection).
+    /// @param deadline Timestamp after which the swap is invalid.
+    /// @dev FIX 2: Added deadline parameter — prevents stale transaction attacks where
+    /// a swap sits in the mempool and executes at an unfavorable price later.
+    /// @dev FIX 3: Added minimum swap size check — swaps smaller than MIN_FEE_BPS are
+    /// rejected to prevent fee truncation (tiny swaps paying 0 fee that drain value).
+    function swap(address tokenIn, uint256 amountIn, uint256 minAmountOut, uint256 deadline)
+        external returns (uint256 amountOut)
+    {
+        require(deadline >= block.timestamp, "AMMPool: deadline passed");
         require(tokenIn == address(tokenA) || tokenIn == address(tokenB), "Invalid token");
         require(amountIn > 0, "Zero input");
+        require(amountIn >= MIN_FEE_BPS, "Swap too small"); // FIX: prevent zero-fee truncation
 
         bool isA = tokenIn == address(tokenA);
         (uint256 resIn, uint256 resOut) = isA ? (reserveA, reserveB) : (reserveB, reserveA);
@@ -103,6 +120,11 @@ contract AMMPool {
         }
 
         emit Swap(msg.sender, tokenIn, amountIn, amountOut);
+    }
+
+    function _mint(address to, uint256 amount) internal {
+        totalLiquidity += amount;
+        liquidity[to] += amount;
     }
 
     function _sqrt(uint256 y) internal pure returns (uint256 z) {

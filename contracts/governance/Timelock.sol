@@ -8,15 +8,17 @@ pragma solidity ^0.8.20;
 contract Timelock {
     uint256 public constant GRACE_PERIOD = 14 days;
     uint256 public constant MAXIMUM_DELAY = 30 days;
+    uint256 public constant MINIMUM_DELAY = 1 days;
 
     address public admin;
     address public pendingAdmin;
     uint256 public delay;
+    bool private _initialized;
 
     mapping(bytes32 => bool) public queuedTransactions;
 
     event NewAdmin(address indexed newAdmin);
-    event NewDelay(uint256 indexed newDelay);
+    event NewDelay(uint256 indexed oldDelay, uint256 indexed newDelay);
     event QueueTransaction(bytes32 indexed txHash, address target, uint256 value, bytes data, uint256 eta);
     event ExecuteTransaction(bytes32 indexed txHash, address target, uint256 value, bytes data, uint256 eta);
     event CancelTransaction(bytes32 indexed txHash, address target, uint256 value, bytes data, uint256 eta);
@@ -27,21 +29,24 @@ contract Timelock {
     }
 
     constructor(address _admin, uint256 _delay) {
+        require(_delay >= MINIMUM_DELAY, "Timelock: delay below minimum");
         require(_delay <= MAXIMUM_DELAY, "Timelock: delay exceeds max");
         admin = _admin;
         delay = _delay;
+        _initialized = true;
     }
 
     /// @notice Update the execution delay.
     /// @param _delay New delay in seconds.
-    // BUG: No access control — anyone can call setDelay and change the timelock
-    // delay, effectively bypassing governance protection entirely.
-    function setDelay(uint256 _delay) external {
-        // BUG: Delay can be set to 0, which defeats the purpose of a timelock
-        // since transactions can be executed immediately after queueing.
+    /// @dev FIX 1: Added onlyAdmin access control — only the admin can change delay.
+    /// @dev FIX 2: Added MINIMUM_DELAY check — delay cannot be set below 1 day,
+    /// preventing admin from setting delay to 0 and bypassing the timelock entirely.
+    function setDelay(uint256 _delay) external onlyAdmin {
+        require(_delay >= MINIMUM_DELAY, "Timelock: delay below minimum");
         require(_delay <= MAXIMUM_DELAY, "Timelock: delay exceeds max");
+        uint256 oldDelay = delay;
         delay = _delay;
-        emit NewDelay(_delay);
+        emit NewDelay(oldDelay, _delay);
     }
 
     /// @notice Accept admin role after being set as pending.
@@ -63,15 +68,15 @@ contract Timelock {
     /// @param value ETH to send.
     /// @param data Encoded calldata.
     /// @param eta Estimated time of availability (unix timestamp).
+    /// @dev FIX: Added eta validation — ensures eta >= block.timestamp + delay,
+    /// preventing admin from setting eta in the past to bypass the timelock.
     function queueTransaction(
         address target,
         uint256 value,
         bytes calldata data,
         uint256 eta
     ) external onlyAdmin returns (bytes32 txHash) {
-        // BUG: Missing eta validation — does not check that eta >= block.timestamp + delay.
-        // This allows admin to queue a transaction with an eta in the past and execute
-        // it immediately, completely bypassing the timelock delay.
+        require(eta >= block.timestamp + delay, "Timelock: eta must be >= now + delay");
         txHash = keccak256(abi.encode(target, value, data, eta));
         queuedTransactions[txHash] = true;
         emit QueueTransaction(txHash, target, value, data, eta);
