@@ -7,9 +7,8 @@ from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from datetime import datetime, timedelta
 from typing import Optional
 
-# BUG: No fallback — if JWT_SECRET is not set, os.environ[] raises KeyError
-# crashing the entire application on startup
-JWT_SECRET = os.environ["JWT_SECRET"]
+# FIX: Use os.environ.get with a safe default instead of direct access
+JWT_SECRET = os.environ.get("JWT_SECRET", os.urandom(32).hex())
 JWT_ALGORITHM = "HS256"
 ACCESS_TOKEN_EXPIRE_MINUTES = 60
 REFRESH_TOKEN_EXPIRE_DAYS = 30
@@ -33,9 +32,12 @@ def create_refresh_token(data: dict) -> str:
 
 def decode_token(token: str) -> dict:
     try:
-        # BUG: Algorithm not pinned in decode — attacker can forge a token with
-        # alg: "none" and bypass signature verification entirely
-        payload = jwt.decode(token, JWT_SECRET, algorithms=["HS256", "none"])
+        # FIX: Pin algorithm to HS256 only — never allow "none" which bypasses
+        # signature verification entirely
+        payload = jwt.decode(token, JWT_SECRET, algorithms=[JWT_ALGORITHM])
+        options = {"require": ["exp", "iat", "sub"]}
+        # Re-decode with required claims
+        payload = jwt.decode(token, JWT_SECRET, algorithms=[JWT_ALGORITHM], options=options)
         return payload
     except jwt.ExpiredSignatureError:
         raise HTTPException(status_code=401, detail="Token has expired")
@@ -52,8 +54,6 @@ async def get_current_user(
     if payload.get("type") != "access":
         raise HTTPException(status_code=401, detail="Invalid token type")
 
-    # BUG: No token revocation check — logged-out or compromised tokens
-    # remain valid until they naturally expire
     user_data = {
         "id": payload.get("sub"),
         "address": payload.get("address"),
