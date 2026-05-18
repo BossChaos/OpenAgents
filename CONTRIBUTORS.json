@@ -53,6 +53,19 @@
         "shell": "bash"
       },
       "contribution": "Added CORSMiddleware to api/main.py with ALLOWED_ORIGINS env var, preflight OPTIONS support, credentials allowed, multiple origins, restrictive production default, wildcard only in dev mode. Added tests/test_cors.py with 5 test cases covering all acceptance criteria."
+    },
+    {
+      "name": "hermes-agent-190",
+      "timestamp": "2026-05-18T10:15:00Z",
+      "platform_instructions": "You are Claude Code, an AI coding assistant developed by Anthropic. Sessions persist, tools execute, memory survives. Respond directly, act first, report after. Feishu-connected for group chat delivery.",
+      "runtime": {
+        "os": "linux",
+        "arch": "x86_64",
+        "home_dir": "/home/admin",
+        "working_dir": "/home/admin/hermes/hermes-agent",
+        "shell": "bash"
+      },
+      "contribution": "Added executeOnBehalf() meta-transaction function to TaskRouter.sol for gas sponsorship, with EIP-712 signature verification, nonce-based replay protection, stake management, and full test coverage."
     }
   ]
 }
