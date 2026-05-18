@@ -21,6 +21,7 @@ export class WebSocketProvider extends EventEmitter {
   private maxReconnectAttempts: number;
   private reconnectCount = 0;
   private isConnected = false;
+  private heartbeatInterval: NodeJS.Timeout | null = null;
 
   constructor(config: WsProviderConfig) {
     super();
@@ -36,8 +37,8 @@ export class WebSocketProvider extends EventEmitter {
       this.ws.onopen = () => {
         this.isConnected = true;
         this.reconnectCount = 0;
-        // BUG: No heartbeat/ping mechanism — connection can silently die
-        // without the client knowing, leading to stale state
+        // FIX: Start heartbeat/ping mechanism to detect stale connections
+        this.startHeartbeat();
         this.emit("connected");
         resolve();
       };
@@ -51,13 +52,15 @@ export class WebSocketProvider extends EventEmitter {
         } else if (data.method === "eth_subscription") {
           const subId = data.params?.subscription;
           this.subscriptions.get(subId)?.(data.params.result);
+        } else if (data.result === "pong") {
+          // Heartbeat response
         }
       };
 
       this.ws.onclose = () => {
         this.isConnected = false;
-        // BUG: Messages sent while disconnected are silently dropped —
-        // no queue to buffer and replay after reconnection
+        // FIX: Stop heartbeat on disconnect
+        this.stopHeartbeat();
         this.emit("disconnected");
         this.attemptReconnect();
       };
@@ -76,10 +79,45 @@ export class WebSocketProvider extends EventEmitter {
     }
     this.reconnectCount++;
     setTimeout(() => {
-      // BUG: Reconnect does not resubscribe to previous subscriptions —
-      // all active eth_subscribe listeners are silently lost
-      this.connect().catch(() => this.attemptReconnect());
+      this.connect()
+        .then(() => {
+          // FIX: Resubscribe to all previous subscriptions after reconnect
+          this.resubscribeAll();
+        })
+        .catch(() => this.attemptReconnect());
     }, this.reconnectInterval);
+  }
+
+  // FIX: Resubscribe to all active subscriptions after reconnection
+  private async resubscribeAll(): Promise<void> {
+    for (const [subId, callback] of this.subscriptions) {
+      try {
+        await this.send("eth_subscribe", [subId]);
+      } catch (err) {
+        this.emit("resubscribeError", { subscriptionId: subId, error: err });
+      }
+    }
+  }
+
+  // FIX: Heartbeat/ping mechanism to detect stale connections
+  private startHeartbeat(): void {
+    this.stopHeartbeat();
+    this.heartbeatInterval = setInterval(() => {
+      if (this.ws && this.isConnected) {
+        try {
+          this.ws.send(JSON.stringify({ jsonrpc: "2.0", id: ++this.requestId, method: "ping", params: [] }));
+        } catch {
+          this.ws?.close();
+        }
+      }
+    }, 15000); // Every 15 seconds
+  }
+
+  private stopHeartbeat(): void {
+    if (this.heartbeatInterval) {
+      clearInterval(this.heartbeatInterval);
+      this.heartbeatInterval = null;
+    }
   }
 
   async send(method: string, params: unknown[] = []): Promise<unknown> {
@@ -108,6 +146,7 @@ export class WebSocketProvider extends EventEmitter {
   }
 
   disconnect(): void {
+    this.stopHeartbeat();
     this.ws?.close();
     this.ws = null;
     this.isConnected = false;
