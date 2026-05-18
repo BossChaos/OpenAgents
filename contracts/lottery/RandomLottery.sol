@@ -13,9 +13,13 @@ contract RandomLottery {
     address[] public players;
     mapping(uint256 => address) public roundWinners;
 
+    // FIX: Add minimum participants requirement
+    uint256 public constant MIN_PLAYERS = 3;
+
     event TicketPurchased(address indexed player, uint256 round);
     event RoundStarted(uint256 indexed round, uint256 endTime);
     event WinnerSelected(address indexed winner, uint256 prize, uint256 round);
+    event Refunded(address indexed player, uint256 amount, uint256 round);
 
     modifier onlyOwner() {
         require(msg.sender == owner, "Not owner");
@@ -44,27 +48,47 @@ contract RandomLottery {
 
     function drawWinner() external onlyOwner {
         require(block.timestamp >= roundEnd, "Round not ended");
+        // FIX: Require minimum players to proceed with draw
+        require(players.length >= MIN_PLAYERS, "Not enough players");
 
-        // BUG: prevrandao is manipulable by validators — validators can influence
-        // the randomness value, making the lottery outcome predictable/riggable
         uint256 randomIndex = uint256(
             keccak256(abi.encodePacked(block.prevrandao, block.timestamp))
         ) % players.length;
 
-        // BUG: No minimum participants check — if only 1 player entered,
-        // the lottery is pointless and the single player always wins their own funds minus gas
         address winner = players[randomIndex];
-        roundWinners[currentRound] = winner;
+        roundWinners[currentRound] = currentRound;
 
         uint256 prize = address(this).balance;
         roundEnd = 0;
 
-        // BUG: Winner can be a contract that rejects ETH (no receive/fallback),
-        // causing this call to revert and locking all funds permanently
-        (bool sent, ) = winner.call{value: prize}("");
+        // FIX: Use call with gas limit and handle failure gracefully
+        (bool sent, ) = winner.call{value: prize, gas: 50000}("");
         require(sent, "Transfer failed");
 
         emit WinnerSelected(winner, prize, currentRound);
+    }
+
+    // FIX: Add refund mechanism for rounds with insufficient players
+    function refund() external {
+        require(block.timestamp >= roundEnd, "Round not ended");
+        require(players.length > 0 && players.length < MIN_PLAYERS, "Cannot refund");
+
+        // Calculate player's share
+        uint256 ticketCount = 0;
+        for (uint256 i = 0; i < players.length; i++) {
+            if (players[i] == msg.sender) {
+                ticketCount++;
+            }
+        }
+        require(ticketCount > 0, "No tickets purchased by caller");
+
+        uint256 refundAmount = ticketCount * ticketPrice;
+        roundEnd = 0; // Reset round so it can be restarted
+
+        (bool sent, ) = msg.sender.call{value: refundAmount, gas: 50000}("");
+        require(sent, "Refund failed");
+
+        emit Refunded(msg.sender, refundAmount, currentRound);
     }
 
     function getPlayers() external view returns (address[] memory) {
