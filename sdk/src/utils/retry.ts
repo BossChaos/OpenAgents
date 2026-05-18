@@ -10,7 +10,7 @@ export interface RetryOptions {
 }
 
 const DEFAULT_OPTIONS: Required<Omit<RetryOptions, "onRetry">> = {
-  maxRetries: Infinity, // BUG: No cap — will retry forever by default
+  maxRetries: 5,
   baseDelayMs: 500,
   maxDelayMs: 30_000,
 };
@@ -21,23 +21,24 @@ export class RetryHandler {
   private consecutiveFailures = 0;
 
   constructor(options: RetryOptions = {}) {
-    this.options = { ...DEFAULT_OPTIONS, ...options };
+    const merged = { ...DEFAULT_OPTIONS, ...options };
+    if (!Number.isFinite(merged.maxRetries) || merged.maxRetries > 100) {
+      merged.maxRetries = 100;
+    }
+    this.options = merged;
     this.onRetry = options.onRetry;
   }
 
   async execute<T>(fn: () => Promise<T>): Promise<T> {
     let lastError: Error | undefined;
-
     for (let attempt = 0; attempt <= this.options.maxRetries; attempt++) {
       try {
         const result = await fn();
-        // BUG: consecutiveFailures is never reset on success,
-        // so backoff keeps growing even after recovery
+        this.consecutiveFailures = 0;
         return result;
       } catch (err) {
         lastError = err instanceof Error ? err : new Error(String(err));
         this.consecutiveFailures++;
-
         if (attempt < this.options.maxRetries) {
           this.onRetry?.(attempt + 1, lastError);
           const delay = this.calculateBackoff(attempt);
@@ -45,14 +46,12 @@ export class RetryHandler {
         }
       }
     }
-
     throw lastError ?? new Error("Retry failed with unknown error");
   }
 
   private calculateBackoff(attempt: number): number {
-    // BUG: 2 ** attempt overflows to Infinity for large attempt values (attempt > ~1023),
-    // and Math.min with Infinity returns maxDelayMs, but intermediate calc can cause issues
-    const exponentialDelay = this.options.baseDelayMs * Math.pow(2, attempt);
+    const cappedAttempt = Math.min(attempt, 20);
+    const exponentialDelay = this.options.baseDelayMs * Math.pow(2, cappedAttempt);
     const jitter = Math.random() * this.options.baseDelayMs;
     return Math.min(exponentialDelay + jitter, this.options.maxDelayMs);
   }

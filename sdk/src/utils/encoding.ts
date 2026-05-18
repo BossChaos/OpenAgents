@@ -2,26 +2,36 @@
  * ABI encoding/decoding utilities for EVM-compatible contract interactions.
  */
 
-export type AbiType = "uint256" | "address" | "bytes32" | "string" | "bool";
+export type AbiType = "uint256" | "address" | "bytes32" | "string" | "bool" | "uint128" | "int256";
 
 export interface AbiParam {
   type: AbiType;
   value: string | number | bigint | boolean;
 }
 
+const MAX_UINT256 = BigInt("0xffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff");
+
 export function encodeUint256(value: bigint | number): string {
   const n = BigInt(value);
-  // BUG: No overflow check — values > 2^256-1 silently wrap/truncate
+  if (n < 0n || n > MAX_UINT256) {
+    throw new Error(`encodeUint256: value ${n} out of uint256 range`);
+  }
   return n.toString(16).padStart(64, "0");
 }
 
 export function encodeAddress(address: string): string {
+  if (!/^0x[0-9a-fA-F]{40}$/.test(address)) {
+    throw new Error(`encodeAddress: invalid address ${address}`);
+  }
   const cleaned = address.startsWith("0x") ? address.slice(2) : address;
   return cleaned.toLowerCase().padStart(64, "0");
 }
 
 export function encodeBytes32(data: string): string {
   const cleaned = data.startsWith("0x") ? data.slice(2) : data;
+  if (cleaned.length > 64) {
+    throw new Error("encodeBytes32: data exceeds 32 bytes");
+  }
   return cleaned.padEnd(64, "0");
 }
 
@@ -34,7 +44,19 @@ export function encodeParams(params: AbiParam[]): string {
   for (const param of params) {
     switch (param.type) {
       case "uint256":
+      case "uint128":
         encoded += encodeUint256(BigInt(param.value as number));
+        break;
+      case "int256":
+        {
+          const n = BigInt(param.value as number);
+          if (n < 0n) {
+            const absVal = (-n - 1n) ^ MAX_UINT256;
+            encoded += (absVal + 1n).toString(16).padStart(64, "0");
+          } else {
+            encoded += n.toString(16).padStart(64, "0");
+          }
+        }
         break;
       case "address":
         encoded += encodeAddress(param.value as string);
@@ -46,8 +68,12 @@ export function encodeParams(params: AbiParam[]): string {
         encoded += encodeBool(param.value as boolean);
         break;
       case "string":
-        const hexStr = Buffer.from(param.value as string).toString("hex");
-        encoded += hexStr.padEnd(64, "0");
+        {
+          const hexStr = Buffer.from(param.value as string, "utf8").toString("hex");
+          const paddedLen = Math.ceil(hexStr.length / 2);
+          encoded += (paddedLen).toString(16).padStart(64, "0");
+          encoded += hexStr.padEnd(((paddedLen + 31) >> 5) * 64, "0");
+        }
         break;
     }
   }
@@ -55,20 +81,24 @@ export function encodeParams(params: AbiParam[]): string {
 }
 
 export function decodeHex(hex: string): bigint {
-  // BUG: Doesn't validate "0x" prefix — a bare decimal string like "255"
-  // would be parsed as hex 0x255 = 597, silently returning wrong value
-  const cleaned = hex.startsWith("0x") ? hex.slice(2) : hex;
-  return BigInt("0x" + cleaned);
+  if (!hex.startsWith("0x")) {
+    throw new Error(`decodeHex: missing 0x prefix in "${hex}"`);
+  }
+  const cleaned = hex.slice(2);
+  if (!/^[0-9a-fA-F]+$/.test(cleaned)) {
+    throw new Error(`decodeHex: invalid hex characters in "${hex}"`);
+  }
+  return BigInt(hex);
 }
 
 export function decodeUint256(slot: string): bigint {
-  // BUG: Doesn't handle short values — if slot is less than 64 chars,
-  // no left-padding is applied before parsing, giving wrong results
-  return BigInt("0x" + slot);
+  const cleaned = slot.startsWith("0x") ? slot.slice(2) : slot;
+  const padded = cleaned.padStart(64, "0");
+  return BigInt("0x" + padded);
 }
 
 export function decodeAddress(slot: string): string {
-  const raw = slot.slice(-40);
+  const raw = slot.slice(-40).padStart(40, "0");
   return "0x" + raw.toLowerCase();
 }
 
@@ -78,7 +108,7 @@ export function decodeBool(slot: string): boolean {
 
 export function functionSelector(signature: string): string {
   const { createHash } = require("crypto");
-  const hash = createHash("sha3-256").update(signature).digest("hex");
+  const hash = createHash("sha3-keccak-256").update(signature).digest("hex");
   return "0x" + hash.slice(0, 8);
 }
 
