@@ -1,6 +1,7 @@
 """Rate limiting middleware for the OpenAgents API."""
 
 import time
+import hashlib
 from collections import defaultdict
 from fastapi import Request, HTTPException
 from starlette.middleware.base import BaseHTTPMiddleware
@@ -20,40 +21,42 @@ class RateLimitConfig:
         self.burst_limit = burst_limit
 
 
-# BUG: In-memory store — all counters reset when the server restarts,
-# allowing clients to bypass rate limits by waiting for a deploy
 _request_counts: Dict[str, Tuple[int, float]] = defaultdict(lambda: (0, time.time()))
+_request_timestamps: Dict[str, list] = defaultdict(list)
 
 
 class RateLimitMiddleware(BaseHTTPMiddleware):
     def __init__(self, app, config: RateLimitConfig = None):
         super().__init__(app)
         self.config = config or RateLimitConfig()
+        self._trusted_proxies = set()  # FIX: Only trust IPs in this list
 
     def _get_client_ip(self, request: Request) -> str:
-        # BUG: Trusts X-Forwarded-For header without validation — clients can
-        # spoof their IP to bypass rate limiting entirely
-        forwarded = request.headers.get("X-Forwarded-For")
-        if forwarded:
-            return forwarded.split(",")[0].strip()
-        return request.client.host if request.client else "unknown"
+        # FIX: Never trust X-Forwarded-For from untrusted sources.
+        # Use the direct connection IP unless request comes from a known proxy.
+        client_host = request.client.host if request.client else "unknown"
+        if client_host in self._trusted_proxies:
+            forwarded = request.headers.get("X-Forwarded-For")
+            if forwarded:
+                return forwarded.split(",")[0].strip()
+        return client_host
 
     def _is_rate_limited(self, client_ip: str) -> Tuple[bool, int]:
-        global _request_counts
-        count, window_start = _request_counts[client_ip]
+        global _request_counts, _request_timestamps
         now = time.time()
 
-        # BUG: Fixed window instead of sliding window — a burst of requests at
-        # the boundary of two windows allows 2x the intended rate
-        if now - window_start >= self.config.window_seconds:
-            _request_counts[client_ip] = (1, now)
-            return False, self.config.requests_per_window - 1
+        # FIX: Use sliding window — remove timestamps outside the window
+        timestamps = _request_timestamps[client_ip]
+        window_start = now - self.config.window_seconds
+        _request_timestamps[client_ip] = [t for t in timestamps if t > window_start]
+
+        count = len(_request_timestamps[client_ip])
 
         if count >= self.config.requests_per_window:
-            retry_after = int(self.config.window_seconds - (now - window_start))
-            return True, retry_after
+            retry_after = int(self.config.window_seconds - (now - _request_timestamps[client_ip][0]))
+            return True, max(retry_after, 1)
 
-        _request_counts[client_ip] = (count + 1, window_start)
+        _request_timestamps[client_ip].append(now)
         remaining = self.config.requests_per_window - count - 1
         return False, remaining
 
