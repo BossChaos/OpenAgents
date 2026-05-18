@@ -1,91 +1,130 @@
-import { ethers } from "ethers";
+import { RpcProvider } from "./providers/rpc";
+import { Wallet } from "./auth/wallet";
+import { SessionManager } from "./auth/session";
 
-export interface AgentConfig {
-  name: string;
-  endpoint: string;
-  privateKey: string;
+export interface OpenAgentsConfig {
   rpcUrl: string;
-  registryAddress: string;
-  routerAddress: string;
+  chainId: number;
+  apiBaseUrl: string;
 }
 
 export class OpenAgentsSDK {
-  private provider: ethers.JsonRpcProvider;
-  private signer: ethers.Wallet;
-  private config: AgentConfig;
+  private provider: RpcProvider;
+  private wallet: Wallet | null = null;
+  private session: SessionManager | null = null;
+  private apiBaseUrl: string;
 
-  constructor(config: AgentConfig) {
-    this.config = config;
-    this.provider = new ethers.JsonRpcProvider(config.rpcUrl);
-    this.signer = new ethers.Wallet(config.privateKey, this.provider);
+  constructor(config: OpenAgentsConfig) {
+    this.provider = new RpcProvider({
+      url: config.rpcUrl,
+      chainId: config.chainId,
+    });
+    this.apiBaseUrl = config.apiBaseUrl;
   }
 
-  async registerAgent(): Promise<string> {
-    const registry = new ethers.Contract(
-      this.config.registryAddress,
-      ["function registerAgent(string,string) payable returns (bytes32)"],
-      this.signer
-    );
-
-    const fee = await registry.registrationFee();
-    const tx = await registry.registerAgent(
-      this.config.name,
-      this.config.endpoint,
-      { value: fee }
-    );
-    const receipt = await tx.wait();
-    return receipt.logs[0].topics[1];
+  /**
+   * Initialize wallet and session for a given private key.
+   */
+  async init(privateKey: string): Promise<void> {
+    this.wallet = new Wallet({
+      privateKey,
+      provider: this.provider,
+    });
+    this.session = new SessionManager({
+      wallet: this.wallet,
+      apiBaseUrl: this.apiBaseUrl,
+    });
   }
 
-  async claimTask(taskId: number, agentId: string): Promise<void> {
-    const router = new ethers.Contract(
-      this.config.routerAddress,
-      ["function assignTask(uint256,bytes32)"],
-      this.signer
-    );
-    const tx = await router.assignTask(taskId, agentId);
-    await tx.wait();
+  /**
+   * Get the current wallet address.
+   */
+  get address(): string | undefined {
+    return this.wallet?.address;
   }
 
-  async submitResult(taskId: number, result: string): Promise<void> {
-    const router = new ethers.Contract(
-      this.config.routerAddress,
-      ["function completeTask(uint256,bytes)"],
-      this.signer
-    );
-    const tx = await router.completeTask(
-      taskId,
-      ethers.toUtf8Bytes(result)
-    );
-    await tx.wait();
+  /**
+   * Get the RPC provider.
+   */
+  getProvider(): RpcProvider {
+    return this.provider;
   }
 
+  /**
+   * Get session token for API calls.
+   */
+  async getSessionToken(): Promise<string> {
+    if (!this.session) throw new Error("SDK not initialized");
+    return this.session.getToken();
+  }
+
+  /**
+   * FIX: Estimate gas for a transaction with a safety margin.
+   * Prevents out-of-gas errors by adding 20% buffer.
+   */
+  async estimateGas(tx: { to: string; data: string; value?: bigint }): Promise<bigint> {
+    if (!this.wallet) throw new Error("Wallet not initialized");
+
+    const gasEstimate = await this.provider.call("eth_estimateGas", [
+      {
+        from: this.wallet.address,
+        to: tx.to,
+        data: tx.data,
+        value: tx.value ? `0x${tx.value.toString(16)}` : "0x0",
+      },
+    ]) as string;
+
+    const gas = BigInt(gasEstimate);
+    // FIX: Add 20% safety margin to prevent out-of-gas reverts
+    return (gas * 120n) / 100n;
+  }
+
+  /**
+   * FIX: Send a transaction with automatic gas estimation and chainId validation.
+   */
+  async sendTransaction(tx: { to: string; data: string; value?: bigint }): Promise<string> {
+    if (!this.wallet) throw new Error("Wallet not initialized");
+
+    const gasLimit = await this.estimateGas(tx);
+    const chainId = this.provider.getChainId();
+
+    return this.wallet.sendTransaction({
+      to: tx.to,
+      data: tx.data,
+      value: tx.value ?? 0n,
+      gasLimit,
+      chainId,
+    });
+  }
+
+  /**
+   * Fetch available tasks from the API.
+   */
   async getOpenTasks(): Promise<any[]> {
-    const router = new ethers.Contract(
-      this.config.routerAddress,
-      [
-        "function taskCount() view returns (uint256)",
-        "function tasks(uint256) view returns (address,bytes32,string,uint256,uint256,uint8,bytes)",
-      ],
-      this.provider
-    );
+    const token = await this.getSessionToken();
+    const res = await fetch(`${this.apiBaseUrl}/tasks`, {
+      headers: { Authorization: `Bearer ${token}` },
+    });
+    if (!res.ok) throw new Error(`API error: ${res.status}`);
+    return res.json();
+  }
 
-    const count = await router.taskCount();
-    const openTasks = [];
+  /**
+   * Get tasks assigned to the current wallet.
+   */
+  async getMyTasks(): Promise<any[]> {
+    const token = await this.getSessionToken();
+    const res = await fetch(`${this.apiBaseUrl}/tasks?creator=${this.address}`, {
+      headers: { Authorization: `Bearer ${token}` },
+    });
+    if (!res.ok) throw new Error(`API error: ${res.status}`);
+    return res.json();
+  }
 
-    for (let i = 0; i < count; i++) {
-      const task = await router.tasks(i);
-      if (task[5] === 0) {
-        openTasks.push({
-          id: i,
-          creator: task[0],
-          description: task[2],
-          reward: task[3],
-          deadline: task[4],
-        });
-      }
-    }
-
-    return openTasks;
+  /**
+   * Logout and clear session.
+   */
+  logout(): void {
+    this.session?.logout();
   }
 }
