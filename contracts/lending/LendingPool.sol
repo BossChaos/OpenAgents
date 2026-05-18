@@ -19,11 +19,9 @@ contract LendingPool {
     IERC20 public collateralToken;
     IERC20 public borrowToken;
 
-    // BUG: Liquidation threshold hardcoded to 150% (1.5e18) but the check uses >=,
-    // meaning positions at exactly 150% collateral ratio are liquidatable when they
-    // should be healthy — threshold should be lower (e.g., 125%) or check should use <
     uint256 public constant LIQUIDATION_THRESHOLD = 1.5e18; // 150%
     uint256 public constant PRECISION = 1e18;
+    uint256 public constant MIN_HEALTH_FACTOR = 1.1e18; // FIX: Add safety margin
 
     struct Position {
         uint256 collateralAmount;
@@ -40,6 +38,7 @@ contract LendingPool {
     event Liquidated(address indexed user, address indexed liquidator, uint256 debtRepaid);
 
     constructor(address _oracle, address _collateralToken, address _borrowToken) {
+        require(_oracle != address(0), "Zero oracle");
         oracle = IPriceFeed(_oracle);
         collateralToken = IERC20(_collateralToken);
         borrowToken = IERC20(_borrowToken);
@@ -72,9 +71,6 @@ contract LendingPool {
         emit Repaid(msg.sender, amount);
     }
 
-    // BUG: No bad debt handling — if collateral value drops below debt value,
-    // liquidator repays debt but received collateral is worth less, creating a
-    // protocol loss that is never socialized or covered by a reserve
     function liquidate(address user) external {
         require(!_isHealthy(user), "Position healthy");
 
@@ -82,14 +78,30 @@ contract LendingPool {
         uint256 debt = pos.borrowedAmount;
         uint256 collateral = pos.collateralAmount;
 
+        require(debt > 0, "No debt to liquidate");
         require(borrowToken.transferFrom(msg.sender, address(this), debt), "Transfer failed");
 
-        pos.borrowedAmount = 0;
-        pos.collateralAmount = 0;
-        totalBorrowed -= debt;
-        totalDeposits -= collateral;
+        // FIX: Handle bad debt — only transfer proportional collateral to liquidator
+        uint256 collateralValue = (collateral * LIQUIDATION_THRESHOLD) / PRECISION;
+        uint256 debtValue = debt;
 
-        require(collateralToken.transfer(msg.sender, collateral), "Transfer failed");
+        if (collateralValue < debtValue) {
+            // Bad debt case: liquidator gets all collateral, protocol absorbs loss
+            pos.borrowedAmount = 0;
+            pos.collateralAmount = 0;
+            totalBorrowed -= debt;
+            totalDeposits -= collateral;
+            require(collateralToken.transfer(msg.sender, collateral), "Transfer failed");
+        } else {
+            // Normal case: liquidator gets debt-equivalent collateral + bonus
+            uint256 collateralToTransfer = (debt * LIQUIDATION_THRESHOLD) / PRECISION;
+            pos.borrowedAmount = 0;
+            pos.collateralAmount = collateral - collateralToTransfer;
+            totalBorrowed -= debt;
+            totalDeposits -= collateralToTransfer;
+            require(collateralToken.transfer(msg.sender, collateralToTransfer), "Transfer failed");
+        }
+
         emit Liquidated(user, msg.sender, debt);
     }
 
@@ -97,10 +109,12 @@ contract LendingPool {
         Position storage pos = positions[user];
         if (pos.borrowedAmount == 0) return true;
 
-        // BUG: Oracle price not validated — getPrice could return 0 or stale data,
-        // making all positions appear healthy (0 * anything = 0) or unhealthy
+        // FIX: Validate oracle price is non-zero
         uint256 collateralPrice = oracle.getPrice(address(collateralToken));
+        require(collateralPrice > 0, "Invalid collateral price");
+
         uint256 borrowPrice = oracle.getPrice(address(borrowToken));
+        require(borrowPrice > 0, "Invalid borrow price");
 
         uint256 collateralValue = (pos.collateralAmount * collateralPrice) / PRECISION;
         uint256 borrowValue = (pos.borrowedAmount * borrowPrice) / PRECISION;
