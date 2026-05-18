@@ -13,8 +13,8 @@ interface AggregatorV3Interface {
 }
 
 /// @title ChainlinkAdapter
-/// @notice Adapter for Chainlink price feeds with normalized 18-decimal output
-/// @dev Wraps one or more Chainlink aggregators behind a simple getPrice interface
+/// @notice Adapter for Chainlink price feeds with staleness + negative price + round validation
+/// @dev Fixes: answeredInRound check, heartbeat staleness, negative price rejection
 contract ChainlinkAdapter {
     address public admin;
     uint256 public constant TARGET_DECIMALS = 18;
@@ -29,6 +29,7 @@ contract ChainlinkAdapter {
 
     event FeedRegistered(address indexed token, address feed, uint256 heartbeat);
     event FeedDeactivated(address indexed token);
+    event PriceStale(address indexed token, uint256 updatedAt, uint256 heartbeat);
 
     modifier onlyAdmin() {
         require(msg.sender == admin, "Not admin");
@@ -61,26 +62,30 @@ contract ChainlinkAdapter {
         emit FeedDeactivated(token);
     }
 
-    // BUG: No roundId completeness check — answeredInRound should equal roundId to
-    // confirm the answer is from the current round; without this check, the contract
-    // may return an answer from a previous round that hasn't been updated
-    // BUG: Stale price allowed — updatedAt is not checked against the heartbeat,
-    // so a feed that hasn't updated in days will still return the last known price
-    // BUG: Negative price not rejected — Chainlink can return negative prices for
-    // certain feeds; casting a negative int256 to uint256 produces a huge incorrect value
     function getPrice(address token) external view returns (uint256) {
         FeedConfig storage config = feeds[token];
         require(config.active, "Feed not active");
 
         (
-            uint80 /* roundId */,
+            uint80 roundId,
             int256 answer,
-            /* uint256 startedAt */,
-            uint256 /* updatedAt */,
-            uint80 /* answeredInRound */
+            uint256 startedAt,
+            uint256 updatedAt,
+            uint80 answeredInRound
         ) = config.feed.latestRoundData();
 
-        // No validation of roundId, staleness, or negative price
+        // FIX: Reject negative prices (int256 -> uint256 cast produces huge value)
+        require(answer >= 0, "Chainlink negative price");
+
+        // FIX: Check roundId completeness — answer must be from the current round
+        require(answeredInRound >= roundId, "Stale round");
+
+        // FIX: Check staleness against heartbeat
+        require(
+            block.timestamp <= updatedAt + config.heartbeat,
+            "Price feed stale"
+        );
+
         uint256 price = uint256(answer);
 
         // Normalize to 18 decimals
@@ -94,6 +99,17 @@ contract ChainlinkAdapter {
         return price;
     }
 
+    // FIX: Multi-hop price with intermediate validation
+    function getMultiHopPrice(address tokenA, address tokenB)
+        external
+        view
+        returns (uint256 priceA, uint256 priceB)
+    {
+        priceA = getPrice(tokenA);
+        priceB = getPrice(tokenB);
+        require(priceB > 0, "Invalid price for token B");
+    }
+
     function getFeedInfo(address token) external view returns (
         address feedAddress,
         uint256 heartbeat,
@@ -101,5 +117,19 @@ contract ChainlinkAdapter {
     ) {
         FeedConfig storage config = feeds[token];
         return (address(config.feed), config.heartbeat, config.active);
+    }
+
+    // FIX: Health check — returns whether a feed is considered healthy
+    function isFeedHealthy(address token) external view returns (bool) {
+        FeedConfig storage config = feeds[token];
+        if (!config.active) return false;
+
+        (, int256 answer,, uint256 updatedAt,) = config.feed.latestRoundData();
+
+        // Negative price or stale = unhealthy
+        if (answer < 0) return false;
+        if (block.timestamp > updatedAt + config.heartbeat) return false;
+
+        return true;
     }
 }
