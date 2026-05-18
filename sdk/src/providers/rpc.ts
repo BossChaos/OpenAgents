@@ -28,6 +28,10 @@ export class RpcProvider {
   private headers: Record<string, string>;
   private requestId = 0;
 
+  // FIX: Add batch size limit and request timeout
+  private static readonly MAX_BATCH_SIZE = 50;
+  private static readonly REQUEST_TIMEOUT_MS = 30_000;
+
   constructor(config: RpcProviderConfig) {
     this.url = config.url;
     this.chainId = config.chainId;
@@ -44,30 +48,41 @@ export class RpcProvider {
     };
 
     return withRetry(async () => {
-      // BUG: No timeout — fetch can hang indefinitely if the RPC node is unresponsive
-      const res = await fetch(this.url, {
-        method: "POST",
-        headers: { "Content-Type": "application/json", ...this.headers },
-        body: JSON.stringify(request),
-      });
+      // FIX: Add timeout to prevent hanging requests
+      const controller = new AbortController();
+      const timeoutId = setTimeout(() => controller.abort(), RpcProvider.REQUEST_TIMEOUT_MS);
 
-      const json = await res.json();
+      try {
+        const res = await fetch(this.url, {
+          method: "POST",
+          headers: { "Content-Type": "application/json", ...this.headers },
+          body: JSON.stringify(request),
+          signal: controller.signal,
+        });
 
-      // BUG: Error response is not type-checked — json.error could have unexpected
-      // shape and json.result is returned even when error is present
-      if (json.error) {
-        throw new Error(`RPC error ${json.error.code}: ${json.error.message}`);
+        const json = await res.json();
+
+        if (json.error) {
+          throw new Error(`RPC error ${json.error.code}: ${json.error.message}`);
+        }
+
+        return json.result;
+      } finally {
+        clearTimeout(timeoutId);
       }
-
-      return json.result;
     }, this.retryOptions);
   }
 
   async batchCall(
     calls: Array<{ method: string; params: unknown[] }>
   ): Promise<unknown[]> {
-    // BUG: No limit on batch size — sending thousands of calls in one batch
-    // can exceed the node's gas/payload limit and fail silently or OOM
+    // FIX: Enforce batch size limit to prevent OOM and node payload limits
+    if (calls.length > RpcProvider.MAX_BATCH_SIZE) {
+      throw new Error(
+        `Batch size ${calls.length} exceeds maximum of ${RpcProvider.MAX_BATCH_SIZE}`
+      );
+    }
+
     const requests: JsonRpcRequest[] = calls.map((c) => ({
       jsonrpc: "2.0" as const,
       id: ++this.requestId,
@@ -75,16 +90,30 @@ export class RpcProvider {
       params: c.params,
     }));
 
-    const res = await fetch(this.url, {
-      method: "POST",
-      headers: { "Content-Type": "application/json", ...this.headers },
-      body: JSON.stringify(requests),
-    });
+    // FIX: Add timeout for batch requests
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), RpcProvider.REQUEST_TIMEOUT_MS);
 
-    const responses: JsonRpcResponse[] = await res.json();
-    return responses
-      .sort((a, b) => a.id - b.id)
-      .map((r) => r.result);
+    try {
+      const res = await fetch(this.url, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", ...this.headers },
+        body: JSON.stringify(requests),
+        signal: controller.signal,
+      });
+
+      const responses: JsonRpcResponse[] = await res.json();
+      return responses
+        .sort((a, b) => a.id - b.id)
+        .map((r) => {
+          if (r.error) {
+            throw new Error(`RPC error ${r.error.code}: ${r.error.message}`);
+          }
+          return r.result;
+        });
+    } finally {
+      clearTimeout(timeoutId);
+    }
   }
 
   async getBlockNumber(): Promise<number> {
