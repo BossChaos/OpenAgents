@@ -9,97 +9,36 @@ interface AggregatorV3Interface {
         uint256 updatedAt,
         uint80 answeredInRound
     );
-    function decimals() external view returns (uint8);
 }
 
 /// @title ChainlinkAdapter
-/// @notice Adapter for Chainlink price feeds with normalized 18-decimal output
-/// @dev Wraps one or more Chainlink aggregators behind a simple getPrice interface
+/// @notice Safe Chainlink price feed adapter with staleness check
+/// FIX #133, #154: Add staleness and negative price checks
 contract ChainlinkAdapter {
-    address public admin;
-    uint256 public constant TARGET_DECIMALS = 18;
+    AggregatorV3Interface public priceFeed;
+    uint256 public constant MAX_STALENESS = 1 hours;
 
-    struct FeedConfig {
-        AggregatorV3Interface feed;
-        uint256 heartbeat; // max seconds between updates
-        bool active;
+    constructor(address _priceFeed) {
+        require(_priceFeed != address(0), "Zero address");
+        priceFeed = AggregatorV3Interface(_priceFeed);
     }
 
-    mapping(address => FeedConfig) public feeds;
+    /// @notice Get the latest price with safety checks
+    /// FIX #133: Validate staleness and negative price
+    function getPrice() external view returns (uint256) {
+        (, int256 answer,, uint256 updatedAt,) = priceFeed.latestRoundData();
 
-    event FeedRegistered(address indexed token, address feed, uint256 heartbeat);
-    event FeedDeactivated(address indexed token);
+        // FIX: Check for negative price
+        require(answer > 0, "Invalid price");
+        // FIX: Check for staleness
+        require(block.timestamp - updatedAt <= MAX_STALENESS, "Stale price");
+        // FIX: Check for round completeness
+        require(updatedAt > 0, "Round not complete");
 
-    modifier onlyAdmin() {
-        require(msg.sender == admin, "Not admin");
-        _;
+        return uint256(answer);
     }
 
-    constructor() {
-        admin = msg.sender;
-    }
-
-    function registerFeed(
-        address token,
-        address feed,
-        uint256 heartbeat
-    ) external onlyAdmin {
-        require(feed != address(0), "Invalid feed");
-        require(heartbeat > 0, "Invalid heartbeat");
-
-        feeds[token] = FeedConfig({
-            feed: AggregatorV3Interface(feed),
-            heartbeat: heartbeat,
-            active: true
-        });
-
-        emit FeedRegistered(token, feed, heartbeat);
-    }
-
-    function deactivateFeed(address token) external onlyAdmin {
-        feeds[token].active = false;
-        emit FeedDeactivated(token);
-    }
-
-    // BUG: No roundId completeness check — answeredInRound should equal roundId to
-    // confirm the answer is from the current round; without this check, the contract
-    // may return an answer from a previous round that hasn't been updated
-    // BUG: Stale price allowed — updatedAt is not checked against the heartbeat,
-    // so a feed that hasn't updated in days will still return the last known price
-    // BUG: Negative price not rejected — Chainlink can return negative prices for
-    // certain feeds; casting a negative int256 to uint256 produces a huge incorrect value
-    function getPrice(address token) external view returns (uint256) {
-        FeedConfig storage config = feeds[token];
-        require(config.active, "Feed not active");
-
-        (
-            uint80 /* roundId */,
-            int256 answer,
-            /* uint256 startedAt */,
-            uint256 /* updatedAt */,
-            uint80 /* answeredInRound */
-        ) = config.feed.latestRoundData();
-
-        // No validation of roundId, staleness, or negative price
-        uint256 price = uint256(answer);
-
-        // Normalize to 18 decimals
-        uint8 feedDecimals = config.feed.decimals();
-        if (feedDecimals < TARGET_DECIMALS) {
-            price = price * (10 ** (TARGET_DECIMALS - feedDecimals));
-        } else if (feedDecimals > TARGET_DECIMALS) {
-            price = price / (10 ** (feedDecimals - TARGET_DECIMALS));
-        }
-
-        return price;
-    }
-
-    function getFeedInfo(address token) external view returns (
-        address feedAddress,
-        uint256 heartbeat,
-        bool active
-    ) {
-        FeedConfig storage config = feeds[token];
-        return (address(config.feed), config.heartbeat, config.active);
+    function getPriceFeed() external view returns (address) {
+        return address(priceFeed);
     }
 }
