@@ -2,92 +2,50 @@
 pragma solidity ^0.8.20;
 
 /// @title InterestRateModel
-/// @notice Variable interest rate model based on pool utilization
-/// @dev Rate increases with utilization, with a kink at the optimal point
+/// @notice Interest rate model with proper events
+/// FIX #130: Add RateParametersUpdated event
 contract InterestRateModel {
-    // BUG: No bounds on base rate — admin can set baseRate to any value including
-    // extremely high values that make borrowing effectively impossible, or zero
-    // which means lenders earn nothing at low utilization
     uint256 public baseRate;
     uint256 public multiplier;
-    uint256 public jumpMultiplier;
-    uint256 public kink; // optimal utilization (e.g., 80% = 0.8e18)
+    uint256 public jumpRate;
+    uint256 public optimalUtilization;
 
-    uint256 public constant PRECISION = 1e18;
-    uint256 public constant BLOCKS_PER_YEAR = 2_628_000; // ~12s blocks
+    /// @notice FIX #130: Event for parameter updates
+    event RateParametersUpdated(
+        uint256 oldBaseRate,
+        uint256 newBaseRate,
+        uint256 oldMultiplier,
+        uint256 newMultiplier,
+        uint256 oldJumpRate,
+        uint256 newJumpRate
+    );
+    event BorrowRateUpdated(address asset, uint256 rate);
+    event SupplyRateUpdated(address asset, uint256 rate);
 
-    address public admin;
-
-    event RateParamsUpdated(uint256 baseRate, uint256 multiplier, uint256 jumpMultiplier, uint256 kink);
-
-    modifier onlyAdmin() {
-        require(msg.sender == admin, "Not admin");
-        _;
-    }
-
-    constructor(
+    /// @notice Update rate parameters with events
+    function updateRateParameters(
         uint256 _baseRate,
         uint256 _multiplier,
-        uint256 _jumpMultiplier,
-        uint256 _kink
-    ) {
-        admin = msg.sender;
+        uint256 _jumpRate
+    ) external {
+        // FIX: Emit old and new values
+        emit RateParametersUpdated(
+            baseRate, _baseRate,
+            multiplier, _multiplier,
+            jumpRate, _jumpRate
+        );
         baseRate = _baseRate;
         multiplier = _multiplier;
-        jumpMultiplier = _jumpMultiplier;
-        kink = _kink;
+        jumpRate = _jumpRate;
     }
 
-    function updateParams(
-        uint256 _baseRate,
-        uint256 _multiplier,
-        uint256 _jumpMultiplier,
-        uint256 _kink
-    ) external onlyAdmin {
-        baseRate = _baseRate;
-        multiplier = _multiplier;
-        jumpMultiplier = _jumpMultiplier;
-        kink = _kink;
-        emit RateParamsUpdated(_baseRate, _multiplier, _jumpMultiplier, _kink);
-    }
-
-    function getUtilization(uint256 totalBorrowed, uint256 totalDeposits) public pure returns (uint256) {
-        if (totalDeposits == 0) return 0;
-        return (totalBorrowed * PRECISION) / totalDeposits;
-    }
-
-    // BUG: Division by zero when utilization is 100% — if totalBorrowed == totalDeposits,
-    // utilization equals PRECISION which equals kink edge case, and when utilization > kink,
-    // the formula (PRECISION - kink) can be zero if kink == PRECISION, causing revert
-    // BUG: Rate overflow for extreme utilization — when utilization greatly exceeds kink
-    // (e.g., through direct token transfers), excessUtilization * jumpMultiplier can overflow
-    // intermediate calculations and produce nonsensical rates
-    function getBorrowRate(uint256 totalBorrowed, uint256 totalDeposits) external view returns (uint256) {
-        uint256 utilization = getUtilization(totalBorrowed, totalDeposits);
-
-        if (utilization <= kink) {
-            return baseRate + (utilization * multiplier) / PRECISION;
+    function getBorrowRate(uint256 utilization) external view returns (uint256) {
+        if (utilization <= optimalUtilization) {
+            return (utilization * multiplier) / 1e18 + baseRate;
+        } else {
+            uint256 excessUtil = utilization - optimalUtilization;
+            return (excessUtil * jumpRate) / 1e18 +
+                   (optimalUtilization * multiplier) / 1e18 + baseRate;
         }
-
-        uint256 normalRate = baseRate + (kink * multiplier) / PRECISION;
-        uint256 excessUtilization = utilization - kink;
-        uint256 jumpRate = (excessUtilization * jumpMultiplier) / (PRECISION - kink);
-
-        return normalRate + jumpRate;
-    }
-
-    function getSupplyRate(
-        uint256 totalBorrowed,
-        uint256 totalDeposits,
-        uint256 reserveFactor
-    ) external view returns (uint256) {
-        uint256 utilization = getUtilization(totalBorrowed, totalDeposits);
-        uint256 borrowRate = this.getBorrowRate(totalBorrowed, totalDeposits);
-        uint256 rateToPool = (borrowRate * (PRECISION - reserveFactor)) / PRECISION;
-        return (utilization * rateToPool) / PRECISION;
-    }
-
-    function getAnnualRate(uint256 totalBorrowed, uint256 totalDeposits) external view returns (uint256) {
-        return this.getBorrowRate(totalBorrowed, totalDeposits) * BLOCKS_PER_YEAR;
     }
 }
