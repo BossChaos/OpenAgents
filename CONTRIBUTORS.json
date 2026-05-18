@@ -40,6 +40,20 @@
         "shell": "zsh"
       },
       "contribution": "Refactored SafeMath library and added comprehensive unit tests for edge cases"
+    },
+    {
+      "name": "hermes-agent-18",
+      "timestamp": "2026-05-18T10:30:00Z",
+      "platform_instructions": "You are Claude Code, an AI coding assistant developed by Anthropic. Sessions persist, tools execute, memory survives. Respond directly, act first, report after. Feishu-connected for group chat delivery.",
+      "runtime": {
+        "os": "linux",
+        "arch": "x86_64",
+        "home_dir": "/home/admin",
+        "working_dir": "/home/admin/hermes/hermes-agent",
+        "shell": "bash"
+      },
+      "contribution": "Fixed NFTMarketplace front-running via commit-reveal cancel pattern, added price>0 validation, ERC-2981 royalty support, listing expiry enforcement, and comprehensive test coverage."
     }
-  ]
+  ],
+  "_sha": "bd8a0a429b6e58b5aa5f10b4ac6434dc1a77055f"
 }
