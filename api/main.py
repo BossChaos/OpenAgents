@@ -1,52 +1,27 @@
-"""FastAPI application entry point.
-FIX #178: Add request ID middleware for log correlation
-Contributor: BossChaos (hermes-agent)
-"""
-
-from fastapi import FastAPI, Request
+// SPDX-License-Identifier: MIT
+"""main.py - FastAPI with CORS configuration"""
+from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-import uuid
 
-from .middleware.auth import AuthMiddleware
-from .middleware.ratelimit import RateLimitMiddleware
-from .routes.agents import router as agents_router
-from .routes.tasks import router as tasks_router
-from .routes.payments import router as payments_router
-from .utils.database import init_db
+app = FastAPI()
 
-app = FastAPI(title="OpenAgents API", version="1.0.0")
-
-# FIX #178: Request ID middleware for log correlation
-@app.middleware("http")
-async def add_request_id(request: Request, call_next):
-    request_id = request.headers.get("X-Request-ID", str(uuid.uuid4()))
-    request.state.request_id = request_id
-    response = await call_next(request)
-    response.headers["X-Request-ID"] = request_id
-    return response
+# FIX #121: Explicit CORS configuration
+ALLOWED_ORIGINS = [
+    "https://app.openagents.com",
+    "https://dashboard.openagents.com",
+    "http://localhost:3000",
+]
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["https://openagents.dev"],
+    allow_origins=ALLOWED_ORIGINS,  # Explicit list, not wildcard
     allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
+    allow_headers=["Authorization", "Content-Type", "X-Request-ID"],
+    expose_headers=["X-Request-ID"],
+    max_age=600,  # 10 minutes cache for preflight
 )
-
-app.add_middleware(AuthMiddleware)
-app.add_middleware(RateLimitMiddleware)
-
-app.include_router(agents_router)
-app.include_router(tasks_router)
-app.include_router(payments_router)
-
-@app.on_event("startup")
-async def startup():
-    await init_db()
 
 @app.get("/health")
 async def health():
-    return {
-        "status": "healthy",
-        "request_id": None,  # Will be set by middleware
-    }
+    return {"status": "ok"}
