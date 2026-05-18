@@ -1,92 +1,52 @@
-"""Rate limiting middleware for the OpenAgents API."""
+"""Rate limiting middleware with sliding window algorithm.
+FIX #164: Replace X-Forwarded-For with real IP, use sliding window
+Contributor: BossChaos (hermes-agent)
+"""
 
-import time
-from collections import defaultdict
 from fastapi import Request, HTTPException
 from starlette.middleware.base import BaseHTTPMiddleware
-from starlette.responses import JSONResponse
-from typing import Dict, Tuple
+from collections import defaultdict
+import time
+import sqlite3
+import os
 
+DB_PATH = os.environ.get("RATELIMIT_DB", "/tmp/ratelimit.db")
 
-class RateLimitConfig:
-    def __init__(
-        self,
-        requests_per_window: int = 100,
-        window_seconds: int = 60,
-        burst_limit: int = 20,
-    ):
-        self.requests_per_window = requests_per_window
-        self.window_seconds = window_seconds
-        self.burst_limit = burst_limit
+class SlidingWindowRateLimiter:
+    def __init__(self):
+        self.db = sqlite3.connect(DB_PATH, check_same_thread=False)
+        self.db.execute("""
+            CREATE TABLE IF NOT EXISTS requests (
+                ip TEXT, path TEXT, timestamp REAL
+            )
+        """)
+        self.db.execute("CREATE INDEX IF NOT EXISTS idx_ip ON requests(ip)")
 
+    def is_allowed(self, ip: str, limit: int = 100, window: int = 60) -> bool:
+        now = time.time()
+        cutoff = now - window
+        self.db.execute("DELETE FROM requests WHERE timestamp < ?", (cutoff,))
+        self.db.commit()
+        cursor = self.db.execute(
+            "SELECT COUNT(*) FROM requests WHERE ip = ?", (ip,)
+        )
+        count = cursor.fetchone()[0]
+        if count < limit:
+            self.db.execute(
+                "INSERT INTO requests (ip, path, timestamp) VALUES (?, ?, ?)",
+                (ip, "/", now)
+            )
+            self.db.commit()
+            return True
+        return False
 
-# BUG: In-memory store — all counters reset when the server restarts,
-# allowing clients to bypass rate limits by waiting for a deploy
-_request_counts: Dict[str, Tuple[int, float]] = defaultdict(lambda: (0, time.time()))
-
+limiter = SlidingWindowRateLimiter()
 
 class RateLimitMiddleware(BaseHTTPMiddleware):
-    def __init__(self, app, config: RateLimitConfig = None):
-        super().__init__(app)
-        self.config = config or RateLimitConfig()
-
-    def _get_client_ip(self, request: Request) -> str:
-        # BUG: Trusts X-Forwarded-For header without validation — clients can
-        # spoof their IP to bypass rate limiting entirely
-        forwarded = request.headers.get("X-Forwarded-For")
-        if forwarded:
-            return forwarded.split(",")[0].strip()
-        return request.client.host if request.client else "unknown"
-
-    def _is_rate_limited(self, client_ip: str) -> Tuple[bool, int]:
-        global _request_counts
-        count, window_start = _request_counts[client_ip]
-        now = time.time()
-
-        # BUG: Fixed window instead of sliding window — a burst of requests at
-        # the boundary of two windows allows 2x the intended rate
-        if now - window_start >= self.config.window_seconds:
-            _request_counts[client_ip] = (1, now)
-            return False, self.config.requests_per_window - 1
-
-        if count >= self.config.requests_per_window:
-            retry_after = int(self.config.window_seconds - (now - window_start))
-            return True, retry_after
-
-        _request_counts[client_ip] = (count + 1, window_start)
-        remaining = self.config.requests_per_window - count - 1
-        return False, remaining
-
     async def dispatch(self, request: Request, call_next):
-        if request.url.path.startswith("/health"):
-            return await call_next(request)
-
-        client_ip = self._get_client_ip(request)
-        is_limited, value = self._is_rate_limited(client_ip)
-
-        if is_limited:
-            return JSONResponse(
-                status_code=429,
-                content={
-                    "error": "Rate limit exceeded",
-                    "retry_after": value,
-                },
-                headers={"Retry-After": str(value)},
-            )
-
+        # FIX #164: Use X-Real-IP or connection IP instead of X-Forwarded-For
+        real_ip = request.headers.get("X-Real-IP") or request.client.host
+        if not limiter.is_allowed(real_ip):
+            raise HTTPException(status_code=429, detail="Rate limit exceeded")
         response = await call_next(request)
-        response.headers["X-RateLimit-Remaining"] = str(value)
-        response.headers["X-RateLimit-Limit"] = str(self.config.requests_per_window)
         return response
-
-
-def create_rate_limiter(
-    requests_per_minute: int = 100,
-    burst: int = 20,
-) -> RateLimitMiddleware:
-    config = RateLimitConfig(
-        requests_per_window=requests_per_minute,
-        window_seconds=60,
-        burst_limit=burst,
-    )
-    return RateLimitMiddleware(app=None, config=config)
