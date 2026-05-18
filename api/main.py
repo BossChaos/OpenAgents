@@ -2,6 +2,7 @@ from fastapi import FastAPI, HTTPException, Query
 from pydantic import BaseModel
 from typing import Optional
 from datetime import datetime
+import time
 
 app = FastAPI(
     title="OpenAgents API",
@@ -102,11 +103,29 @@ async def leaderboard(limit: int = Query(20, le=50)):
     return entries[:limit]
 
 
+# FIX: Health check with component-level status monitoring
 @app.get("/health")
 async def health():
+    uptime = time.time() - app.state.start_time if hasattr(app.state, "start_time") else 0
+
+    components = {
+        "api": {"status": "healthy", "response_time_ms": 0},
+        "agent_indexer": {"status": "healthy" if agents_cache else "degraded"},
+        "task_indexer": {"status": "healthy" if tasks_cache else "degraded"},
+    }
+
+    overall = "healthy" if all(c["status"] == "healthy" for c in components.values()) else "degraded"
+
     return {
-        "status": "ok",
+        "status": overall,
+        "uptime_seconds": round(uptime, 2),
+        "components": components,
         "agents_indexed": len(agents_cache),
         "tasks_indexed": len(tasks_cache),
         "timestamp": datetime.utcnow().isoformat(),
     }
+
+
+@app.on_event("startup")
+async def startup():
+    app.state.start_time = time.time()
