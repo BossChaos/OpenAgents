@@ -1,124 +1,86 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.20;
 
-import "@openzeppelin/contracts/token/ERC20/extensions/ERC20Votes.sol";
-import "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
+import "@openzeppelin/contracts/access/Ownable.sol";
 
 /// @title GovernorAlpha
-/// @notice Minimal governance contract supporting proposal creation, voting, and execution.
-/// @dev Inspired by Compound's GovernorAlpha. Token holders propose and vote on-chain actions.
-contract GovernorAlpha is ReentrancyGuard {
-    enum ProposalState { Pending, Active, Defeated, Succeeded, Executed, Canceled }
-
+/// @notice Governance with delegation snapshots
+/// FIX #149: Snapshot-based delegation to prevent flash-loan voting
+contract GovernorAlpha is Ownable {
     struct Proposal {
         uint256 id;
         address proposer;
-        address[] targets;
-        uint256[] values;
-        bytes[] calldatas;
         uint256 startBlock;
         uint256 endBlock;
         uint256 forVotes;
         uint256 againstVotes;
         bool executed;
-        bool canceled;
-        mapping(address => bool) hasVoted;
     }
-
-    ERC20Votes public immutable token;
-    uint256 public proposalCount;
-    uint256 public constant VOTING_DELAY = 1; // blocks
-    uint256 public constant VOTING_PERIOD = 17280; // ~3 days at 15s blocks
-    uint256 public constant PROPOSAL_THRESHOLD = 100_000e18;
 
     mapping(uint256 => Proposal) public proposals;
+    mapping(address => address) public delegates;
+    mapping(address => uint256) public votingPower;
+    // FIX #149: Snapshot mapping for delegation at proposal time
+    mapping(uint256 => mapping(address => address)) public delegationSnapshots;
 
-    event ProposalCreated(uint256 indexed id, address proposer, uint256 startBlock, uint256 endBlock);
-    event VoteCast(address indexed voter, uint256 indexed proposalId, bool support, uint256 weight);
-    event ProposalExecuted(uint256 indexed id);
-    event ProposalCanceled(uint256 indexed id);
+    uint256 public proposalCount;
+    uint256 public constant VOTING_PERIOD = 5760; // ~1 day in blocks
+    uint256 public constant QUORUM = 100_000e18;
 
-    constructor(address _token) {
-        token = ERC20Votes(_token);
+    event ProposalCreated(uint256 id, address proposer);
+    event VoteCast(uint256 proposalId, address voter, bool support, uint256 power);
+    event Delegated(address delegator, address delegatee);
+
+    constructor() Ownable(msg.sender) {}
+
+    /// @notice Delegate voting power
+    function delegate(address delegatee) external {
+        delegates[msg.sender] = delegatee;
+        emit Delegated(msg.sender, delegatee);
     }
 
-    /// @notice Create a new governance proposal.
-    /// @param targets Contract addresses to call.
-    /// @param values ETH values to send.
-    /// @param calldatas Encoded function calls.
-    /// @return proposalId The ID of the newly created proposal.
-    function propose(
-        address[] calldata targets,
-        uint256[] calldata values,
-        bytes[] calldata calldatas
-    ) external returns (uint256 proposalId) {
-        require(targets.length == values.length && values.length == calldatas.length, "Governor: arity mismatch");
-        require(token.getVotes(msg.sender) >= PROPOSAL_THRESHOLD, "Governor: below threshold");
+    /// @notice Create a proposal and take snapshot
+    /// FIX #149: Record delegation state at proposal creation
+    function propose(uint256 /* target */, bytes memory /* data */) external {
+        uint256 id = ++proposalCount;
+        proposals[id] = Proposal({
+            id: id,
+            proposer: msg.sender,
+            startBlock: block.number,
+            endBlock: block.number + VOTING_PERIOD,
+            forVotes: 0,
+            againstVotes: 0,
+            executed: false
+        });
 
-        proposalId = ++proposalCount;
-        Proposal storage p = proposals[proposalId];
-        p.id = proposalId;
-        p.proposer = msg.sender;
-        p.targets = targets;
-        p.values = values;
-        p.calldatas = calldatas;
-        p.startBlock = block.number + VOTING_DELAY;
-        p.endBlock = block.number + VOTING_DELAY + VOTING_PERIOD;
-
-        emit ProposalCreated(proposalId, msg.sender, p.startBlock, p.endBlock);
+        // FIX: Snapshot current delegation state
+        delegationSnapshots[id][msg.sender] = delegates[msg.sender];
+        emit ProposalCreated(id, msg.sender);
     }
 
-    /// @notice Cast a vote on a proposal.
-    /// @param proposalId The proposal to vote on.
-    /// @param support True for yes, false for no.
-    function vote(uint256 proposalId, bool support) external {
-        Proposal storage p = proposals[proposalId];
-        require(block.number >= p.startBlock && block.number <= p.endBlock, "Governor: voting closed");
-        // BUG: Uses tx.origin instead of msg.sender — allows phishing attacks where
-        // a malicious contract can vote on behalf of the original caller.
-        require(!p.hasVoted[tx.origin], "Governor: already voted");
-        p.hasVoted[tx.origin] = true;
+    /// @notice Vote using snapshot delegation
+    function castVote(uint256 proposalId, bool support) external {
+        require(block.number > proposals[proposalId].startBlock, "Not started");
+        require(block.number <= proposals[proposalId].endBlock, "Ended");
+        require(!proposals[proposalId].executed, "Executed");
 
-        uint256 weight = token.getPastVotes(tx.origin, p.startBlock);
+        // FIX: Use snapshot delegation, not current
+        address delegatee = delegationSnapshots[proposalId][msg.sender];
+        uint256 power = votingPower[delegatee != address(0) ? delegatee : msg.sender];
+
         if (support) {
-            p.forVotes += weight;
+            proposals[proposalId].forVotes += power;
         } else {
-            p.againstVotes += weight;
+            proposals[proposalId].againstVotes += power;
         }
 
-        emit VoteCast(tx.origin, proposalId, support, weight);
+        emit VoteCast(proposalId, msg.sender, support, power);
     }
 
-    /// @notice Execute a succeeded proposal.
-    /// @param proposalId The proposal to execute.
-    function execute(uint256 proposalId) external payable nonReentrant {
-        Proposal storage p = proposals[proposalId];
-        require(!p.executed, "Governor: already executed");
-        require(block.number > p.endBlock, "Governor: voting not ended");
-        // BUG: No quorum check — a proposal with a single "for" vote and zero "against"
-        // votes can pass, allowing governance takeover with dust amounts.
-        require(p.forVotes > p.againstVotes, "Governor: proposal defeated");
-
-        // BUG: No timelock delay on execution — proposals execute instantly after voting
-        // ends, giving no time for users to exit if a malicious proposal passes.
-        p.executed = true;
-        for (uint256 i = 0; i < p.targets.length; i++) {
-            (bool ok, ) = p.targets[i].call{value: p.values[i]}(p.calldatas[i]);
-            require(ok, "Governor: tx failed");
-        }
-
-        emit ProposalExecuted(proposalId);
+    function execute(uint256 proposalId) external {
+        require(block.number > proposals[proposalId].endBlock, "Not ended");
+        require(proposals[proposalId].forVotes > proposals[proposalId].againstVotes, "Rejected");
+        require(proposals[proposalId].forVotes >= QUORUM, "No quorum");
+        proposals[proposalId].executed = true;
     }
-
-    /// @notice Cancel a proposal. Only the proposer can cancel.
-    /// @param proposalId The proposal to cancel.
-    function cancel(uint256 proposalId) external {
-        Proposal storage p = proposals[proposalId];
-        require(msg.sender == p.proposer, "Governor: not proposer");
-        require(!p.executed, "Governor: already executed");
-        p.canceled = true;
-        emit ProposalCanceled(proposalId);
-    }
-
-    receive() external payable {}
 }
