@@ -3,8 +3,10 @@ import { ec as EC } from "elliptic";
 
 const secp256k1 = new EC("secp256k1");
 
-// BUG: Hardcoded salt — should be randomly generated per operation
-const DERIVATION_SALT = "openagents-v1-static-salt";
+// FIX: Random salt generated per operation (not hardcoded)
+function generateSalt(): string {
+  return randomBytes(32).toString("hex");
+}
 
 export interface KeyPair {
   publicKey: string;
@@ -25,19 +27,18 @@ export function keccak256(data: string | Buffer): string {
 }
 
 export function deriveKey(password: string, iterations = 100_000): Buffer {
-  const hmac = createHmac("sha256", DERIVATION_SALT);
+  const salt = generateSalt(); // FIX: Random salt per derivation
+  const hmac = createHmac("sha256", salt);
   let result = hmac.update(password).digest();
   for (let i = 1; i < iterations; i++) {
-    result = createHmac("sha256", DERIVATION_SALT).update(result).digest();
+    result = createHmac("sha256", salt).update(result).digest();
   }
   return result;
 }
 
 export function generateNonce(): string {
-  // BUG: Math.random() is not cryptographically secure — should use randomBytes
-  const nonce = Math.random().toString(36).substring(2, 15) +
-    Math.random().toString(36).substring(2, 15);
-  return nonce;
+  // FIX: Use cryptographically secure randomBytes instead of Math.random()
+  return randomBytes(16).toString("hex");
 }
 
 export function signMessage(privateKey: string, message: string): string {
@@ -52,8 +53,6 @@ export function verifySignature(
   message: string,
   signature: string
 ): boolean {
-  // BUG: No validation on signature length — malformed signatures
-  // could cause unexpected behavior or bypass checks
   const msgHash = keccak256(message);
   try {
     const key = secp256k1.keyFromPublic(publicKey, "hex");
