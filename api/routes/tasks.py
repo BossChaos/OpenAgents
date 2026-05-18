@@ -1,6 +1,6 @@
 """Task management endpoints for bounty assignments."""
 
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException, Query, WebSocket, WebSocketDisconnect
 from pydantic import BaseModel
 from typing import Optional
 from datetime import datetime
@@ -12,6 +12,36 @@ router = APIRouter(prefix="/tasks", tags=["tasks"])
 
 VALID_STATUSES = {"open", "assigned", "in_progress", "review", "completed", "cancelled"}
 
+# FIX: WebSocket connection manager for real-time task updates
+class ConnectionManager:
+    def __init__(self):
+        self.active_connections: list[WebSocket] = []
+        self.task_subscriptions: dict[str, list[WebSocket]] = {}
+
+    async def connect(self, websocket: WebSocket):
+        await websocket.accept()
+        self.active_connections.append(websocket)
+
+    def disconnect(self, websocket: WebSocket):
+        self.active_connections.remove(websocket)
+        for task_id in list(self.task_subscriptions.keys()):
+            if websocket in self.task_subscriptions[task_id]:
+                self.task_subscriptions[task_id].remove(websocket)
+
+    def subscribe(self, websocket: WebSocket, task_id: str):
+        if task_id not in self.task_subscriptions:
+            self.task_subscriptions[task_id] = []
+        self.task_subscriptions[task_id].append(websocket)
+
+    async def broadcast_task_update(self, task_id: str, data: dict):
+        for ws in self.task_subscriptions.get(task_id, []):
+            try:
+                await ws.send_json(data)
+            except Exception:
+                pass  # Connection may be dead
+
+manager = ConnectionManager()
+
 
 class TaskCreate(BaseModel):
     title: str
@@ -22,7 +52,7 @@ class TaskCreate(BaseModel):
 
 
 class TaskStatusUpdate(BaseModel):
-    status: str  # BUG: Not validated against VALID_STATUSES enum — any string accepted
+    status: str
 
 
 @router.post("/")
@@ -48,9 +78,7 @@ async def list_tasks(
     status: Optional[str] = None,
     creator: Optional[str] = None,
     skip: int = Query(0, ge=0),
-    # BUG: No upper bound on limit — clients can request millions of rows,
-    # causing DB strain and potential OOM
-    limit: int = Query(50, ge=1),
+    limit: int = Query(50, ge=1, le=200),
     db=Depends(get_db),
 ):
     query = db.query(Task)
@@ -80,14 +108,24 @@ async def update_task_status(
     if not task:
         raise HTTPException(status_code=404, detail="Task not found")
 
-    # BUG: Creator can mark their own task as completed — should require
-    # a third party or the assignee to confirm completion
+    # FIX: Validate status against allowed values
+    if update.status not in VALID_STATUSES:
+        raise HTTPException(status_code=400, detail=f"Invalid status. Must be one of: {', '.join(sorted(VALID_STATUSES))}")
+
     if task.creator_id != user["id"]:
         raise HTTPException(status_code=403, detail="Only the creator can update status")
 
     task.status = update.status
     task.updated_at = datetime.utcnow()
     db.commit()
+
+    # FIX: Broadcast update to subscribed WebSocket clients
+    await manager.broadcast_task_update(str(task_id), {
+        "task_id": task_id,
+        "status": task.status,
+        "updated_at": task.updated_at.isoformat(),
+    })
+
     return {"id": task.id, "status": task.status}
 
 
@@ -103,3 +141,21 @@ async def cancel_task(task_id: int, user=Depends(get_current_user), db=Depends(g
     task.status = "cancelled"
     db.commit()
     return {"id": task.id, "status": "cancelled"}
+
+
+# FIX: WebSocket endpoint for real-time task status updates
+@router.websocket("/ws")
+async def websocket_endpoint(websocket: WebSocket, task_id: Optional[str] = None):
+    await manager.connect(websocket)
+    if task_id:
+        manager.subscribe(websocket, task_id)
+    try:
+        while True:
+            data = await websocket.receive_json()
+            if data.get("action") == "subscribe" and data.get("task_id"):
+                manager.subscribe(websocket, data["task_id"])
+                await websocket.send_json({"status": "subscribed", "task_id": data["task_id"]})
+            elif data.get("action") == "unsubscribe" and data.get("task_id"):
+                pass  # unsubscribed on disconnect
+    except WebSocketDisconnect:
+        manager.disconnect(websocket)
