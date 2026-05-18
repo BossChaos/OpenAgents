@@ -23,36 +23,38 @@ export interface SignedTransaction {
 }
 
 export class Wallet {
-  // BUG: Private key stored as plaintext string in memory — should use
-  // a secure enclave, encrypted storage, or at minimum a Buffer that can be zeroed
   public readonly address: string;
-  private privateKey: string;
+  private privateKey: Buffer; // FIX: Use Buffer that can be zeroed
   private provider: RpcProvider;
   private cachedNonce: number | null = null;
 
   constructor(config: WalletConfig) {
     if (config.privateKey) {
-      this.privateKey = config.privateKey;
+      // FIX: Store as Buffer instead of plaintext string
+      this.privateKey = Buffer.from(config.privateKey, "hex");
     } else {
       const keyPair = generateKeyPair();
-      this.privateKey = keyPair.privateKey;
+      this.privateKey = Buffer.from(keyPair.privateKey, "hex");
     }
     this.address = this.deriveAddress(this.privateKey);
     this.provider = config.provider;
   }
 
-  private deriveAddress(privateKey: string): string {
+  private deriveAddress(privateKey: Buffer): string {
     const { ec as EC } = require("elliptic");
     const curve = new EC("secp256k1");
     const key = curve.keyFromPrivate(privateKey, "hex");
-    const pubKey = key.getPublic(false, "hex").slice(2); // remove 04 prefix
+    const pubKey = key.getPublic(false, "hex").slice(2);
     const hash = keccak256(Buffer.from(pubKey, "hex"));
     return "0x" + hash.slice(-40);
   }
 
   async signTransaction(tx: Transaction): Promise<SignedTransaction> {
-    // BUG: No chain ID validation — transaction could be replayed on a different
-    // chain if chainId is missing or mismatched with the provider
+    // FIX: Validate chainId is provided to prevent replay attacks
+    if (!tx.chainId) {
+      throw new Error("chainId is required to prevent replay attacks");
+    }
+
     const nonce = tx.nonce ?? await this.getNonce();
     const gasPrice = tx.gasPrice ?? BigInt(await this.provider.call("eth_gasPrice") as string);
 
@@ -65,7 +67,7 @@ export class Wallet {
     ]);
 
     const txHash = keccak256(txData);
-    const signature = signMessage(this.privateKey, txHash);
+    const signature = signMessage(this.privateKey.toString("hex"), txHash);
 
     return {
       raw: "0x" + txData.slice(2) + signature,
@@ -74,17 +76,12 @@ export class Wallet {
   }
 
   async getNonce(): Promise<number> {
-    // BUG: Uses cached nonce instead of fetching fresh from chain —
-    // stale nonce causes "nonce too low" errors after external transactions
-    if (this.cachedNonce !== null) {
-      return this.cachedNonce++;
-    }
+    // FIX: Always fetch fresh nonce from chain to prevent "nonce too low" errors
     const hex = (await this.provider.call("eth_getTransactionCount", [
       this.address,
       "latest",
     ])) as string;
-    this.cachedNonce = parseInt(hex, 16);
-    return this.cachedNonce++;
+    return parseInt(hex, 16);
   }
 
   async getBalance(): Promise<bigint> {
@@ -96,7 +93,13 @@ export class Wallet {
     return (await this.provider.call("eth_sendRawTransaction", [signed.raw])) as string;
   }
 
+  // FIX: Return copy of key, allow caller to zero the original
   exportPrivateKey(): string {
-    return this.privateKey;
+    return this.privateKey.toString("hex");
+  }
+
+  // FIX: Add method to zero the private key in memory
+  destroy(): void {
+    this.privateKey.fill(0);
   }
 }
