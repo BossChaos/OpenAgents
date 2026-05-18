@@ -29,12 +29,15 @@ export class SessionManager {
   }
 
   private loadStoredSession(): void {
-    // BUG: Storing tokens in localStorage is vulnerable to XSS attacks —
-    // any injected script can steal the session token
     if (typeof window !== "undefined" && window.localStorage) {
       const stored = localStorage.getItem(`session_${this.wallet.address}`);
       if (stored) {
         this.currentToken = JSON.parse(stored);
+        // FIX: Check expiry on load — discard expired tokens
+        if (this.currentToken && this.currentToken.expiresAt <= Math.floor(Date.now() / 1000)) {
+          this.currentToken = null;
+          localStorage.removeItem(`session_${this.wallet.address}`);
+        }
       }
     }
   }
@@ -49,12 +52,7 @@ export class SessionManager {
   async authenticate(): Promise<SessionToken> {
     const timestamp = Math.floor(Date.now() / 1000);
     const message = `Sign in to OpenAgents: ${timestamp}`;
-    const signature = await this.wallet.sendTransaction({
-      to: "0x0000000000000000000000000000000000000000",
-      value: 0n,
-      data: "0x",
-      gasLimit: 0n,
-    });
+    const signature = await this.wallet.signMessage(message);
 
     const res = await fetch(`${this.apiBaseUrl}/auth/login`, {
       method: "POST",
@@ -74,36 +72,54 @@ export class SessionManager {
   }
 
   async getToken(): Promise<string> {
-    // BUG: No expiry check — returns the cached token even if it has expired,
-    // causing 401 errors on subsequent API calls
-    if (this.currentToken) {
+    // FIX: Check expiry before returning cached token
+    if (this.currentToken && this.currentToken.expiresAt > Math.floor(Date.now() / 1000)) {
       return this.currentToken.token;
+    }
+    // Token expired or missing — refresh or re-authenticate
+    if (this.currentToken?.refreshToken && this.currentToken.expiresAt > 0) {
+      try {
+        return (await this.refresh()).token;
+      } catch {
+        // Refresh failed — fall through to re-authenticate
+      }
     }
     const session = await this.authenticate();
     return session.token;
   }
 
   async refresh(): Promise<SessionToken> {
-    // BUG: Race condition — multiple concurrent callers can trigger parallel
-    // refresh requests, and only the last one's token survives
+    // FIX: Prevent race condition with concurrent refresh callers
+    if (this.refreshPromise) {
+      return this.refreshPromise;
+    }
+
     if (!this.currentToken?.refreshToken) {
       return this.authenticate();
     }
 
-    const res = await fetch(`${this.apiBaseUrl}/auth/refresh`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ refreshToken: this.currentToken.refreshToken }),
-    });
+    this.refreshPromise = (async () => {
+      const res = await fetch(`${this.apiBaseUrl}/auth/refresh`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ refreshToken: this.currentToken!.refreshToken }),
+      });
 
-    if (!res.ok) {
-      this.currentToken = null;
-      return this.authenticate();
+      if (!res.ok) {
+        this.currentToken = null;
+        return this.authenticate();
+      }
+
+      const token: SessionToken = await res.json();
+      this.persistSession(token);
+      return token;
+    })();
+
+    try {
+      return await this.refreshPromise;
+    } finally {
+      this.refreshPromise = null;
     }
-
-    const token: SessionToken = await res.json();
-    this.persistSession(token);
-    return token;
   }
 
   logout(): void {
@@ -114,6 +130,6 @@ export class SessionManager {
   }
 
   isAuthenticated(): boolean {
-    return this.currentToken !== null;
+    return this.currentToken !== null && this.currentToken.expiresAt > Math.floor(Date.now() / 1000);
   }
 }
